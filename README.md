@@ -4,91 +4,140 @@
 
 ## Requirements
 
-- **Python 3.10** or **3.11** (recommended)
-- Git
-- pip (included with Python)
+For the **Recommended Workflow**, you need:
 
-## Prerequisites
+- **Python 3.11** (required for `python3.11 -m venv .venv` command)
+- **Git** (for cloning the repository)
+- **pip** (included with Python, for installing dependencies)
+- **requirements.txt** file (present in the repository)
 
-Before starting, ensure you have Python installed on your system:
+**Alternative:** Python 3.10 or later can be used, but Python 3.11 is specifically recommended for this project.
 
-```bash
-python3 --version
-```
+## Python 3.11 Setup (Recommended)
 
-## Step-by-Step Setup
+This project is tested and recommended to run with Python 3.11. Follow the platform-specific instructions below to install Python 3.11 and create a virtual environment.
 
-### 1. Clone the Repository
+### macOS (Homebrew)
 
-```bash
-git clone <repository-url>
-cd Self-Supervised-Learning-for-Robot-Motion-Planning
-```
-
-### 2. Create a Virtual Environment
-
-Create a Python virtual environment to isolate project dependencies:
+Install Python 3.11 using Homebrew:
 
 ```bash
-python3 -m venv .venv
+brew install python@3.11
 ```
 
-### 3. Activate the Virtual Environment
+Verify the installation:
 
-**For macOS/Linux:**
+```bash
+python3.11 --version
+```
+
+If `python3.11` command is not found after installation, link it:
+
+```bash
+brew link python@3.11 --force
+```
+
+### Linux (Ubuntu/Debian)
+
+Install Python 3.11 and required dependencies:
+
+```bash
+sudo apt update
+sudo apt install python3.11 python3.11-venv python3.11-dev
+```
+
+Verify the installation:
+
+```bash
+python3.11 --version
+```
+
+### Windows
+
+1. Download Python 3.11 from the [official Python website](https://www.python.org/downloads/release/python-3110/)
+2. Run the installer
+3. **Important:** Check the box "Add Python to PATH" during installation
+4. Verify in Command Prompt or PowerShell:
+
+```cmd
+python --version
+```
+
+### Creating a Virtual Environment with Python 3.11
+
+Once Python 3.11 is installed, create a virtual environment:
+
+```bash
+python3.11 -m venv .venv
+```
+
+**For Windows (if `python3.11` is not available):**
+
+```cmd
+python -m venv .venv
+```
+
+Then activate the environment:
+
+**macOS/Linux:**
 
 ```bash
 source .venv/bin/activate
 ```
 
-**For Windows (Command Prompt):**
+**Windows (Command Prompt):**
 
 ```cmd
 .venv\Scripts\activate
 ```
 
-**For Windows (PowerShell):**
+**Windows (PowerShell):**
 
 ```powershell
 .venv\Scripts\Activate.ps1
 ```
 
-You should see `(.venv)` at the beginning of your terminal prompt when the environment is active.
+### Fallback: Using Default Python
 
-### 4. Install Dependencies
-
-Install all required packages from the `requirements.txt` file:
+If Python 3.11 is not available, you can use the default Python 3.x installation:
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
 ```
 
-### 5. Verify Installation (Optional)
-
-Confirm that your environment is properly configured:
+**Note:** This is not recommended as the environment may use a different Python version. Verify the Python version within the virtual environment after activation:
 
 ```bash
 python --version
-pip list
 ```
 
-This will display your Python version and all installed packages.
-
-## Quick Start
-
-For a rapid setup, run these minimal commands:
-
+### Install dependencies
 ```bash
-git clone <repository-url>
-cd Self-Supervised-Learning-for-Robot-Motion-Planning
-python3 -m venv .venv
-source .venv/bin/activate          # macOS/Linux
-# .venv\Scripts\activate            # Windows
 pip install -r requirements.txt
 ```
 
+### Recommended Workflow
 
-### Deactivating the Virtual Environment
+For a clean and consistent setup, follow these steps:
+
+```bash
+# Clone repository
+git clone <repository-url>
+cd Self-Supervised-Learning-for-Robot-Motion-Planning
+
+# Create virtual environment with Python 3.11
+python3.11 -m venv .venv
+
+# Activate environment
+source .venv/bin/activate          # macOS/Linux
+# .venv\Scripts\activate            # Windows CMD
+# .venv\Scripts\Activate.ps1        # Windows PowerShell
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Deactivating the Virtual Environment
 
 To exit the virtual environment when finished:
 

@@ -1,0 +1,33 @@
+# === Python ===
+pycache/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# === macOS ===
+.DS_Store
+
+# === IDEs ===
+.vscode/
+.idea/
+
+# === Git Submodules ===
+# (Wichtig: NICHT den Ordner ignorieren!)
+# external/SimpleArm/  <-- NICHT ignorieren
+
+# === Misc ===
+*.swp
+*.tmp

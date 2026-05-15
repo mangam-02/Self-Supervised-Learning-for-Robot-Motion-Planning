@@ -2,55 +2,68 @@ import torch
 import torch.nn as nn
 
 
-def build_bspline_matrix(T, C, degree=3, device="cpu"):
+# ----------------------------
+# B-Spline utilities
+# ----------------------------
+
+def _cox_de_boor(t, i, k, knots):
+    if k == 0:
+        return ((knots[i] <= t) & (t < knots[i + 1])).float()
+    denom1 = knots[i + k] - knots[i]
+    denom2 = knots[i + k + 1] - knots[i + 1]
+    term1 = 0 if denom1 == 0 else (t - knots[i]) / denom1 * _cox_de_boor(t, i, k - 1, knots)
+    term2 = 0 if denom2 == 0 else (knots[i + k + 1] - t) / denom2 * _cox_de_boor(t, i + 1, k - 1, knots)
+    return term1 + term2
+
+
+def _bspline_basis(t_vals, C, degree, device="cpu"):
     """
-    Builds a B-spline basis matrix A ∈ [T, C]
-    Each row sums weighted cubic B-spline basis functions.
+    B-spline basis matrix [len(t_vals), C] with clamped uniform knots.
+    The last row is corrected so the curve passes through the last
+    control point at t=1 (standard clamped B-spline property).
     """
-
-    def cox_de_boor(t, i, k, knots):
-        if k == 0:
-            return ((knots[i] <= t) & (t < knots[i + 1])).float()
-        denom1 = knots[i + k] - knots[i]
-        denom2 = knots[i + k + 1] - knots[i + 1]
-
-        term1 = (
-            0
-            if denom1 == 0
-            else (t - knots[i]) / denom1 * cox_de_boor(t, i, k - 1, knots)
-        )
-        term2 = (
-            0
-            if denom2 == 0
-            else (knots[i + k + 1] - t) / denom2 * cox_de_boor(t, i + 1, k - 1, knots)
-        )
-
-        return term1 + term2
-
-    # time grid
-    t_vals = torch.linspace(0, 1, T, device=device)
-
-    # clamped uniform knots
     knots = torch.linspace(0, 1, C - degree + 1, device=device)
-    knots = torch.cat(
-        [torch.zeros(degree, device=device), knots, torch.ones(degree, device=device)]
-    )
+    knots = torch.cat([torch.zeros(degree, device=device), knots, torch.ones(degree, device=device)])
 
-    A = torch.zeros(T, C, device=device)
-
+    A = torch.zeros(len(t_vals), C, device=device)
     for ti, t in enumerate(t_vals):
         for i in range(C):
-            A[ti, i] = cox_de_boor(t, i, degree, knots)
+            A[ti, i] = _cox_de_boor(t, i, degree, knots)
 
+    # Cox-de-Boor uses a half-open interval, so t=1 evaluates to 0 for
+    # the last basis function. Fix by enforcing the clamped endpoint property.
+    A[-1, :] = 0
+    A[-1, -1] = 1
     return A
 
+
+def build_bspline_matrix(T, C, degree=3, device="cpu"):
+    """Evaluation matrix [T, C] for B-spline curve evaluation."""
+    return _bspline_basis(torch.linspace(0, 1, T, device=device), C, degree, device)
+
+
+def build_bspline_interpolation_matrix(T, C, degree=3, device="cpu"):
+    """
+    Returns M = A_eval @ inv(A_interp) ∈ [T, C].
+
+    Given C waypoints P (including fixed start P[0] and goal P[-1]),
+    the trajectory traj = M @ P is a B-spline that passes exactly
+    through all C waypoints — including the endpoints.
+    """
+    A_interp = _bspline_basis(torch.linspace(0, 1, C, device=device), C, degree, device)
+    A_eval   = _bspline_basis(torch.linspace(0, 1, T, device=device), C, degree, device)
+    return A_eval @ torch.linalg.inv(A_interp)
+
+
+# ----------------------------
+# Encoder / Decoder modules
+# ----------------------------
 
 class EnvEncoder(nn.Module):
     def __init__(self, latent=64):
         super().__init__()
-
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 4, 2, 1),  # 128 → 64
+            nn.Conv2d(1, 16, 4, 2, 1),   # 128 → 64
             nn.ReLU(),
             nn.Conv2d(16, 32, 4, 2, 1),  # 64 → 32
             nn.ReLU(),
@@ -58,184 +71,125 @@ class EnvEncoder(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
         )
-
         self.fc = nn.Linear(64, latent)
 
     def forward(self, x):
-        x = self.net(x).squeeze(-1).squeeze(-1)
-        return self.fc(x)
+        return self.fc(self.net(x).squeeze(-1).squeeze(-1))
 
 
 class EnvDecoder(nn.Module):
     def __init__(self, latent=64):
         super().__init__()
-
         self.fc = nn.Linear(latent, 64 * 16 * 16)
-
         self.net = nn.Sequential(
             nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 16 → 32
             nn.ReLU(),
             nn.ConvTranspose2d(32, 16, 4, 2, 1),  # 32 → 64
             nn.ReLU(),
-            nn.ConvTranspose2d(16, 1, 4, 2, 1),  # 64 → 128
+            nn.ConvTranspose2d(16, 1, 4, 2, 1),   # 64 → 128
         )
 
     def forward(self, z):
-        x = self.fc(z)
-        x = x.view(-1, 64, 16, 16)  # [B, 64, 16, 16]
-
-        return self.net(x)
+        return self.net(self.fc(z).view(-1, 64, 16, 16))
 
 
 class StateEncoder(nn.Module):
-    def __init__(self, dof=3, hidden=128):
+    def __init__(self, dof=3, hidden=128, latent_dim=64):
         super().__init__()
-
         self.net = nn.Sequential(
-            nn.Linear(2 * dof, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU()
+            nn.Linear(2 * dof, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),  nn.ReLU(),
+            nn.Linear(hidden, latent_dim),
         )
 
     def forward(self, q_start, q_goal):
-        x = torch.cat([q_start, q_goal], dim=-1)
-        return self.net(x)
+        return self.net(torch.cat([q_start, q_goal], dim=-1))
 
 
 class StateDecoder(nn.Module):
-    def __init__(self, dof=3, hidden=128):
+    def __init__(self, dof=3, latent_dim=64, hidden=128):
         super().__init__()
-
         self.net = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 2 * dof)
+            nn.Linear(latent_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),    nn.ReLU(),
+            nn.Linear(hidden, 2 * dof),
         )
 
     def forward(self, z):
         x = self.net(z)
-
-        # split back into start / goal
-        q_start = x[:, :3]
-        q_goal = x[:, 3:]
-
-        return q_start, q_goal
+        return x[:, :3], x[:, 3:]
 
 
-class ControlPointDecoder(nn.Module):
-    def __init__(self, latent_env=64, latent_state=128, C=10, dof=3):
+class WaypointDecoder(nn.Module):
+    """Predicts C-2 interior waypoints (start and goal are fixed externally)."""
+    def __init__(self, latent_env=64, latent_state=64, C=10, dof=3):
         super().__init__()
-
         self.C = C
         self.dof = dof
-
         self.mlp = nn.Sequential(
             nn.Linear(latent_env + latent_state, 256),
             nn.ReLU(),
-            nn.Linear(256, C * dof),
+            nn.Linear(256, (C - 2) * dof),
         )
 
     def forward(self, z_env, z_state):
-        z = torch.cat([z_env, z_state], dim=-1)
-        out = self.mlp(z)
-        return out.view(-1, self.C, self.dof)
+        return self.mlp(torch.cat([z_env, z_state], dim=-1)).view(-1, self.C - 2, self.dof)
 
 
 # ----------------------------
-# Full Model: Warm Start Planner (B-spline + delta)
+# Full Model: Warm Start Planner (B-spline interpolation)
 # ----------------------------
-
 
 class WarmStartPlanner(nn.Module):
     def __init__(self, dof=3, T=50, C=10):
         super().__init__()
-
         self.T = T
         self.C = C
         self.dof = dof
 
-        self.env_encoder = EnvEncoder()
-        self.state_encoder = StateEncoder(dof=dof)
-        self.decoder = ControlPointDecoder(dof=dof, C=C)
+        self.env_encoder   = EnvEncoder()
+        self.state_encoder = StateEncoder(dof=dof, latent_dim=64)
+        self.decoder       = WaypointDecoder(dof=dof, C=C)
+
+        # Precompute and store interpolation matrix as a buffer so it
+        # moves to the correct device automatically with .to(device).
+        self.register_buffer("M", build_bspline_interpolation_matrix(T, C, degree=3))
 
     def forward(self, q_start, q_goal, sdf):
-        device = q_start.device
+        inner = self.decoder(self.env_encoder(sdf), self.state_encoder(q_start, q_goal))
 
-        # Encode inputs
-        z_env = self.env_encoder(sdf)
-        z_state = self.state_encoder(q_start, q_goal)
+        # Interpolation waypoints: start and goal are exact, network fills the interior
+        waypoints = torch.cat([q_start.unsqueeze(1), inner, q_goal.unsqueeze(1)], dim=1)
 
-        # Predict delta control points
-        delta_ctrl = self.decoder(z_env, z_state)
-        print(f"Delta control points: {delta_ctrl}")
+        # traj[b, t] = M[t] @ waypoints[b] — passes exactly through all waypoints
+        return torch.einsum("tc,bcd->btd", self.M, waypoints)
 
-        # Baseline: straight line control points
-        B = torch.linspace(0, 1, self.C, device=device).unsqueeze(-1)
-        baseline = q_start.unsqueeze(1) * (1 - B) + q_goal.unsqueeze(1) * B
 
-        # Combine baseline + delta
-        ctrl_pts = baseline + delta_ctrl
-
-        A = build_bspline_matrix(self.T, self.C, degree=3, device=device)
-        traj = torch.einsum("tc,bcd->btd", A, ctrl_pts)
-
-        # FIX: enforce correct endpoint
-
-        traj[:, -1, :] = ctrl_pts[:, -1, :]
-
-        return traj
-
+# ----------------------------
+# Autoencoders
+# ----------------------------
 
 class StateAutoEncoder(nn.Module):
     def __init__(self, dof=3, latent_dim=64):
         super().__init__()
-
-        # -------------------------
-        # Encoder
-        # input: [q_start, q_goal]
-        # shape: [B, 2*dof]
-        # -------------------------
-        self.encoder = nn.Sequential(
-            nn.Linear(2 * dof, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, latent_dim),
-        )
-
-        # -------------------------
-        # Decoder
-        # latent -> reconstructed state
-        # -------------------------
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2 * dof),
-        )
+        self.encoder = StateEncoder(dof=dof, latent_dim=latent_dim)
+        self.decoder = StateDecoder(dof=dof, latent_dim=latent_dim)
 
     def encode(self, q_start, q_goal):
-        x = torch.cat([q_start, q_goal], dim=-1)
-        z = self.encoder(x)
-        return z
+        return self.encoder(q_start, q_goal)
 
     def decode(self, z):
-        x_rec = self.decoder(z)
-
-        q_start_rec = x_rec[:, :3]
-        q_goal_rec = x_rec[:, 3:]
-
-        return q_start_rec, q_goal_rec
+        return self.decoder(z)
 
     def forward(self, q_start, q_goal):
         z = self.encode(q_start, q_goal)
-
         q_start_rec, q_goal_rec = self.decode(z)
-
         return q_start_rec, q_goal_rec, z
 
 
 class EnvAutoEncoder(nn.Module):
     def __init__(self, latent_dim=64):
         super().__init__()
-
         self.encoder = EnvEncoder(latent=latent_dim)
         self.decoder = EnvDecoder(latent=latent_dim)
 
@@ -247,5 +201,4 @@ class EnvAutoEncoder(nn.Module):
 
     def forward(self, x):
         z = self.encode(x)
-        x_rec = self.decode(z)
-        return x_rec, z
+        return self.decoder(z), z

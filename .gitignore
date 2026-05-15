@@ -28,6 +28,11 @@ env/
 # (Wichtig: NICHT den Ordner ignorieren!)
 # external/SimpleArm/  <-- NICHT ignorieren
 
+# === Data ===
+src/data/
+
 # === Misc ===
 *.swp
 *.tmp
+# hunkwise
+.vscode/hunkwise/

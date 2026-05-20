@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from utils import forward_kinematics_torch
 
 # ----------------------------
 # B-Spline utilities
@@ -140,18 +141,16 @@ class StateEncoder(nn.Module):
     """
     FCN that processes the robot's movement task
     """
-    def __init__(self, dof=3, hidden=128, latent_dim=64):
+    def __init__(self, input_dim, hidden=128, latent_dim=64):
         super().__init__()
-        # Convert the q_start and q_goal information into a latent vector
         self.net = nn.Sequential(
-            nn.Linear(2 * dof, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden),  nn.ReLU(),
+            nn.Linear(input_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),    nn.ReLU(),
             nn.Linear(hidden, latent_dim),
         )
 
-    def forward(self, q_start, q_goal):
-        # Data flow
-        return self.net(torch.cat([q_start, q_goal], dim=-1))
+    def forward(self, x):
+        return self.net(x)
 
 
 class StateDecoder(nn.Module):
@@ -159,19 +158,16 @@ class StateDecoder(nn.Module):
     FCN that unpackages the robot's movement task information from
     the latent vector.
     """
-    def __init__(self, dof=3, latent_dim=64, hidden=128):
+    def __init__(self, output_dim, latent_dim=64, hidden=128):
         super().__init__()
-        # From the latent vector, recover q_start and q_goal
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden),    nn.ReLU(),
-            nn.Linear(hidden, 2 * dof),
+            nn.Linear(hidden, output_dim),
         )
 
     def forward(self, z):
-        # Data flow
-        x = self.net(z)
-        return x[:, :3], x[:, 3:]
+        return self.net(z)
 
 
 class WaypointDecoder(nn.Module):
@@ -202,33 +198,42 @@ class WaypointDecoder(nn.Module):
 
 class WarmStartPlanner(nn.Module):
     """
-    Unifies the previous individual modules into a warm start trajectory 
+    Unifies the previous individual modules into a warm start trajectory
     planner.
     """
-    def __init__(self, dof=3, T=50, C=10):
+    def __init__(self, dof=3, T=50, C=10, linklengths=None):
         super().__init__()
-        # Network components
-        self.T = T
-        self.C = C
+        self.T   = T
+        self.C   = C
         self.dof = dof
+
+        ll = torch.tensor(linklengths, dtype=torch.float32) if linklengths is not None \
+             else torch.ones(dof, dtype=torch.float32)
+        self.register_buffer("linklengths", ll)
+
+        # FK produces (dof+1) joint positions in 2D for each config
+        fk_dim         = (dof + 1) * 2
+        state_input_dim = 2 * dof + 2 * fk_dim   # q_start + q_goal + fk_start + fk_goal
+
         self.env_encoder   = EnvEncoder()
-        self.state_encoder = StateEncoder(dof=dof, latent_dim=64)
+        self.state_encoder = StateEncoder(input_dim=state_input_dim, latent_dim=64)
         self.decoder       = WaypointDecoder(dof=dof, C=C)
 
-        # Precompute and store interpolation matrix as a buffer so it
-        # moves to the correct device automatically with .to(device).
         self.register_buffer("M", build_bspline_interpolation_matrix(T, C, degree=3))
 
+    def _state_features(self, q_start, q_goal):
+        fk_start = forward_kinematics_torch(q_start, self.linklengths).flatten(1)  # [B, (dof+1)*2]
+        fk_goal  = forward_kinematics_torch(q_goal,  self.linklengths).flatten(1)
+        return torch.cat([q_start, q_goal, fk_start, fk_goal], dim=-1)
+
     def forward(self, q_start, q_goal, sdf):
-        # Planning flow
-        # Obtain the interior waypoints from the environment and robot 
-        # state latent spaces
-        inner = self.decoder(self.env_encoder(sdf), self.state_encoder(q_start, q_goal))
+        """Returns C waypoints [B, C, dof] — use .trajectory() to get the full B-spline."""
+        state = self._state_features(q_start, q_goal)
+        inner = self.decoder(self.env_encoder(sdf), self.state_encoder(state))
+        return torch.cat([q_start.unsqueeze(1), inner, q_goal.unsqueeze(1)], dim=1)
 
-        # Interpolation waypoints: start and goal are exact, so the network fills the interior
-        waypoints = torch.cat([q_start.unsqueeze(1), inner, q_goal.unsqueeze(1)], dim=1)
-
-        # traj[b, t] = M[t] @ waypoints[b] — passes exactly through all waypoints
+    def trajectory(self, waypoints):
+        """Evaluates the B-spline at T timesteps. Input: [B, C, dof] → Output: [B, T, dof]."""
         return torch.einsum("tc,bcd->btd", self.M, waypoints)
 
 
@@ -239,26 +244,36 @@ class WarmStartPlanner(nn.Module):
 class StateAutoEncoder(nn.Module):
     """
     Learns a compressed representation of the robot's movement task.
+    Encoder input: [q_start, q_goal, fk_start, fk_goal]
+    Decoder output: [q_start, q_goal]  (FK is deterministic from q, no need to reconstruct)
     """
-    def __init__(self, dof=3, latent_dim=64):
+    def __init__(self, dof=3, latent_dim=64, linklengths=None):
         super().__init__()
-        # Define the encoder and decoder
-        self.encoder = StateEncoder(dof=dof, latent_dim=latent_dim)
-        self.decoder = StateDecoder(dof=dof, latent_dim=latent_dim)
+        ll = torch.tensor(linklengths, dtype=torch.float32) if linklengths is not None \
+             else torch.ones(dof, dtype=torch.float32)
+        self.register_buffer("linklengths", ll)
+
+        fk_dim   = (dof + 1) * 2
+        feat_dim = 2 * dof + 2 * fk_dim   # [q_start, q_goal, fk_start, fk_goal]
+        self.encoder = StateEncoder(input_dim=feat_dim, latent_dim=latent_dim)
+        self.decoder = StateDecoder(output_dim=feat_dim, latent_dim=latent_dim)
+
+    def _features(self, q_start, q_goal):
+        fk_start = forward_kinematics_torch(q_start, self.linklengths).flatten(1)
+        fk_goal  = forward_kinematics_torch(q_goal,  self.linklengths).flatten(1)
+        return torch.cat([q_start, q_goal, fk_start, fk_goal], dim=-1)
 
     def encode(self, q_start, q_goal):
-        # q_start, q_goal -> latent space
-        return self.encoder(q_start, q_goal)
+        return self.encoder(self._features(q_start, q_goal))
 
     def decode(self, z):
-        # latent space -> q_start, q_goal
         return self.decoder(z)
 
     def forward(self, q_start, q_goal):
-        # Training flow
-        z = self.encode(q_start, q_goal)
-        q_start_rec, q_goal_rec = self.decode(z)
-        return q_start_rec, q_goal_rec, z
+        features = self._features(q_start, q_goal)
+        z        = self.encoder(features)
+        rec      = self.decoder(z)
+        return rec, features, z
 
 
 class EnvAutoEncoder(nn.Module):

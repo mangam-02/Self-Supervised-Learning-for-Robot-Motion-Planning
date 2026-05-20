@@ -25,12 +25,8 @@ def compute_smoothness_cost(q, dt=0.1, weight=1.0):
     q: Tensor with the configurations
     dt: Time step
     """
-    # Penalize velocity
     vel = (q[..., 1:, :] - q[..., :-1, :]) / dt
-
-    # Penalize acceleration
     acc = (vel[..., 1:, :] - vel[..., :-1, :]) / dt
-
     return weight * (torch.mean(vel ** 2) + torch.mean(acc ** 2))
 
 def compute_collision_cost(distances, eps=0.1, weight=1.0):
@@ -62,6 +58,16 @@ def compute_trajectory_joint_limits_cost(q_traj, q_min, q_max, weight=1.0):
     lower_violation = torch.clamp(q_min - q_traj, min=0)
     upper_violation = torch.clamp(q_traj - q_max, min=0)
     return weight * torch.sum(lower_violation ** 2 + upper_violation ** 2) / q_traj.shape[1]
+
+def compute_trajectory_velocity_cost(q_traj, dt=0.1, weight=1.0):
+    """
+    Penalizes joint velocities on the B-spline trajectory — higher velocity = higher cost.
+    q_traj: [B, T, dof]
+    dt: Time step
+    """
+    vel = (q_traj[..., 1:, :] - q_traj[..., :-1, :]) / dt
+    return weight * torch.mean(vel ** 2)
+
 
 def compute_trajectory_collision_cost(q_traj, sdf_batch, robot_info,
                                       grid_length=2.5, eps=0.1, weight=1.0):

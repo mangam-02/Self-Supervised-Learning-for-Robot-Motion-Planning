@@ -450,6 +450,36 @@ def generate_dataset(
     return dataset
 
 
+def generate_sdf_dataset(
+    N: int = 12000,
+    save_path: str | None = None,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Generates N random SDF environments for environment autoencoder pre-training.
+    Returns a [N, 1, H, W] tensor. Saves to save_path if given (loads from cache if exists).
+    """
+    if save_path is not None and os.path.exists(save_path):
+        dataset = torch.load(save_path, weights_only=True)
+        print(f"SDF dataset loaded: {save_path}  shape={tuple(dataset.shape)}")
+        return dataset
+
+    rng  = np.random.default_rng(seed)
+    sdfs = []
+    for _ in tqdm(range(N), desc="Generating SDF dataset"):
+        n_obs = int(rng.integers(1, 5))
+        obs   = sample_circular_obstacles(n_obstacles=n_obs, rng=rng)
+        sdfs.append(build_sdf_tensor(obs))
+    dataset = torch.stack(sdfs)
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        torch.save(dataset, save_path)
+        print(f"SDF dataset saved: {save_path}  shape={tuple(dataset.shape)}")
+
+    return dataset
+
+
 def print_dataset_stats(dataset: dict | str, n_collision_check: int = 100):
     """
     Print dataset statistics and a start-config collision sanity check.

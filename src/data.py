@@ -30,19 +30,26 @@ def build_sdf_tensor(
     grid_length: float = 2.5,
     n_vox: int = 128,
 ) -> torch.Tensor:
-    """Convert an Obstacles object to a [1, H, W] SDF tensor."""
+    """
+    Converts an Obstacles object to a [1, H, W] SDF tensor.
+    """
     grid = SquareGrid(
         data=np.zeros((n_vox, n_vox)),
         length=grid_length,
         origin=SE2.identity(),
     )
+
+    # Create circles in the grid
     x = np.linspace(-grid_length / 2, grid_length / 2, n_vox)
     y = np.linspace(-grid_length / 2, grid_length / 2, n_vox)
     X, Y = np.meshgrid(x, y)
     for i in range(len(obstacles.r)):
         dist = np.sqrt((X - obstacles.x[i]) ** 2 + (Y - obstacles.y[i]) ** 2)
         grid.data[dist <= obstacles.r[i]] = 1.0
+
     sdf = grid.derive_sdf_from_voxels().data
+
+    # Convert the SDF to a tensor
     return torch.from_numpy(sdf).float().unsqueeze(0)
 
 
@@ -56,8 +63,7 @@ def sample_circular_obstacles(
     max_tries: int = 300,
 ) -> Obstacles:
     """
-    Sample n_obstacles circular obstacles within the robot workspace.
-
+    Samples n_obstacles circular obstacles within the robot workspace.
     Obstacles are placed via polar coordinates (r in [0.15, 0.85*workspace_radius])
     so they always lie within the robot's reachable area. A minimum surface-to-surface
     separation is enforced to keep paths feasible.
@@ -68,10 +74,14 @@ def sample_circular_obstacles(
     positions, radii = [], []
     for _ in range(n_obstacles):
         for _ in range(max_tries):
+            # Polar coordinates to guarantee that the obstacles are created within
+            # the workspace
             r     = rng.uniform(0.15, workspace_radius * 0.85)
             theta = rng.uniform(0, 2 * np.pi)
             x, y  = r * np.cos(theta), r * np.sin(theta)
             rad   = rng.uniform(r_min, r_max)
+
+            # Validate that the obstacles do not collide between them
             ok = all(
                 np.sqrt((x - px) ** 2 + (y - py) ** 2) >= rad + pr + min_separation
                 for (px, py), pr in zip(positions, radii)
@@ -81,9 +91,11 @@ def sample_circular_obstacles(
                 radii.append(rad)
                 break
 
+    # Backup plan if there were not valid obstacles
     if not positions:
         positions, radii = [(0.5, 0.0)], [0.1]
 
+    # Return the valid positions
     xy = np.array(positions)
     return Obstacles(x=xy[:, 0], y=xy[:, 1], r=np.array(radii))
 
@@ -93,7 +105,9 @@ def visualize_environment(
     grid_length: float = 2.5,
     ax=None,
 ):
-    """Plot a single SDF environment (obstacles filled, boundary contoured)."""
+    """
+    Plots a single SDF environment (obstacles filled, boundary contoured).
+    """
     sdf = sdf_tensor.squeeze(0).numpy()
     xs  = np.linspace(-grid_length / 2, grid_length / 2, sdf.shape[1])
     ys  = np.linspace(-grid_length / 2, grid_length / 2, sdf.shape[0])
@@ -121,11 +135,12 @@ def is_collision_free(
     grid_length: float = 2.5,
     clearance: float = 0.0,
 ) -> bool:
-    """Return True when all robot spheres at joint configuration q have SDF > clearance."""
+    """
+    Returns True when all robot spheres at joint configuration q have SDF > clearance.
+    """
     q_t     = torch.from_numpy(q).float().unsqueeze(0)
-    sdf_hw  = sdf_tensor.squeeze(0)
     spheres = get_world_spheres_torch(q_t, robot)
-    dists   = query_sdf_differentiable(sdf_hw, spheres.reshape(-1, 2), grid_length)
+    dists   = query_sdf_differentiable(sdf_tensor, spheres, grid_length)
     return bool((dists > clearance).all())
 
 
@@ -138,16 +153,14 @@ def straight_line_blocked(
     n_check: int = 9,
 ) -> bool:
     """
-    Return True if any interior point on the joint-space straight line is in collision.
-
+    Returns True if any interior point on the joint-space straight line is in collision.
     Only non-trivial pairs (straight line blocked) provide a useful training signal —
     a trivial pair would teach the network to output straight-line interpolations.
     """
-    sdf_hw = sdf_tensor.squeeze(0)
     ts = np.linspace(0, 1, n_check + 2)[1:-1]
     for t in ts:
         q_mid = (1 - t) * q_start + t * q_goal
-        if not is_collision_free(q_mid, sdf_hw.unsqueeze(0), robot, grid_length):
+        if not is_collision_free(q_mid, sdf_tensor, robot, grid_length):
             return True
     return False
 
@@ -165,23 +178,26 @@ def sample_valid_pair(
     rng: np.random.Generator = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
-    Sample a (q_start, q_goal) pair satisfying:
+    Samples a (q_start, q_goal) pair satisfying:
       1. Both configs are collision-free (with optional clearance margin).
       2. (if require_nontrivial) The straight joint-space path is blocked.
-
     Returns None if no valid pair is found within max_tries attempts.
     """
     if rng is None:
         rng = np.random.default_rng()
 
     for _ in range(max_tries):
+        # Random start and goal configurations
         q_start = rng.uniform(q_min, q_max)
         q_goal  = rng.uniform(q_min, q_max)
 
+        # Verify that they are collision free
         if not is_collision_free(q_start, sdf_tensor, robot, grid_length, clearance):
             continue
         if not is_collision_free(q_goal, sdf_tensor, robot, grid_length, clearance):
             continue
+
+        # Verify that they are non trivial
         if require_nontrivial and not straight_line_blocked(
             q_start, q_goal, sdf_tensor, robot, grid_length, n_check_midpoints
         ):
@@ -216,10 +232,8 @@ def compute_reference_trajectory(
     q_max: np.ndarray = None,
 ) -> tuple[np.ndarray, bool]:
     """
-    B-spline CHOMP with sinusoidal restarts.
-
-    Optimizes C-2 interior waypoints with fixed start and goal endpoints.
-    Sinusoidal perturbations bias restarts toward globally different solutions.
+    B-spline CHOMP with sinusoidal restarts. Optimizes C-2 interior waypoints with fixed start 
+    and goal endpoints. Sinusoidal perturbations bias restarts toward globally different solutions.
     A velocity-limit penalty prevents tunneling (arm crossing obstacles between frames).
 
     Args:
@@ -232,39 +246,58 @@ def compute_reference_trajectory(
     Returns:
       (q_traj [T, dof], success)
     """
+    # Prepare dimensions
     q_s = torch.tensor(q_start, dtype=torch.float32)
     q_g = torch.tensor(q_goal,  dtype=torch.float32)
     dof = len(q_start)
-
     sdf_batch    = sdf_tensor.unsqueeze(0)  # [1, 1, H, W]
+    
+    # B-spline transformation matrix
     M            = build_bspline_interpolation_matrix(T, C, degree=3)
+    
+    # Initial path: straight line
     t_inner      = torch.linspace(0, 1, C)[1:-1]
     straight     = q_s * (1 - t_inner[:, None]) + q_g * t_inner[:, None]
+    
+    # Needed for the restarts
     sin_envelope = torch.sin(torch.pi * t_inner)
 
+    # Initialiaze parameters
     q_min_t = torch.tensor(q_min, dtype=torch.float32) if q_min is not None else None
     q_max_t = torch.tensor(q_max, dtype=torch.float32) if q_max is not None else None
-
     best_traj, best_coll_rate = None, float("inf")
 
+    # Restart loop
     for restart in range(n_restarts):
+        # Start using a straight line
         if restart == 0:
             init = straight.clone()
+        
+        # Escaping plan
         else:
+            # Apply the sin envelope in a random direction
             direction    = torch.randn(dof)
             direction    = direction / (direction.norm() + 1e-8)
             amplitude    = 0.6 * restart
             perturbation = amplitude * sin_envelope[:, None] * direction[None, :]
             init         = straight + perturbation
 
+        # Track the q_inner evolution for the gradients
         q_inner = init.detach().clone().requires_grad_(True)
+        
+        # Optimizer configuration
         opt     = torch.optim.Adam([q_inner], lr=lr)
 
+        # Optimization loop
         for _ in range(n_iter):
+            # Delete previous gradients
             opt.zero_grad()
+
+            # Generate the full trajectory
             waypoints = torch.cat([q_s.unsqueeze(0), q_inner, q_g.unsqueeze(0)], dim=0)
             q_traj    = M @ waypoints  # [T, dof]
 
+            # Compute the losses
             loss_smooth = compute_smoothness_cost(q_traj.unsqueeze(0), dt=1.0, weight=w_smooth)
             loss_coll   = compute_trajectory_collision_cost(
                 q_traj.unsqueeze(0), sdf_batch, robot,
@@ -277,22 +310,28 @@ def compute_reference_trajectory(
                 if q_min_t is not None else 0.0
             )
 
+            # Backward propagation and update
             (loss_smooth + loss_coll + loss_vel + loss_jl).backward()
             opt.step()
 
+        # Stop gradient computation and obtain the final optimized trajectory
         with torch.no_grad():
             wp      = torch.cat([q_s.unsqueeze(0), q_inner, q_g.unsqueeze(0)], dim=0)
             q_final = M @ wp  # [T, dof]
-
+        
+        # Obtain the distances from the robot to the obstacles
         sdf_hw    = sdf_tensor.squeeze(0)
         spheres   = get_world_spheres_torch(q_final, robot)
         dists     = query_sdf_differentiable(sdf_hw, spheres.reshape(-1, 2), grid_length)
+        
+        # Calculate the collision rate and compare with previous restarts to
+        # keep the best one
         coll_rate = (dists < 0).float().mean().item()
-
         if coll_rate < best_coll_rate:
             best_coll_rate = coll_rate
             best_traj      = q_final.numpy()
 
+    # Return the best trajectory and if it surpasses the success threshold
     return best_traj, best_coll_rate <= success_threshold
 
 
@@ -331,9 +370,8 @@ def generate_dataset(
     save_path: str = "data/training_dataset.pt",
 ) -> dict:
     """
-    Full data generation pipeline for the WarmStartPlanner.
-
-    For each of N_envs environments:
+    Full data generation pipeline for the WarmStartPlanner. For each of N_envs
+    environments:
       1. Sample circular obstacles (workspace-aware, min separation enforced).
       2. Build an SDF tensor [1, H, W].
       3. Sample pairs_per_env valid (q_start, q_goal) pairs:
@@ -354,13 +392,16 @@ def generate_dataset(
     if clearance is None:
         clearance = sphere_rad  # sphere surface must be outside obstacles
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed) # Random seed fixed
 
+    # Define empty containers
     all_sdfs, all_q_starts, all_q_goals, all_trajs = [], [], [], []
     all_obs_x, all_obs_y, all_obs_r, all_n_obs    = [], [], [], []
     n_attempted, n_no_pair, n_chomp_failed         = 0, 0, 0
 
+    #Environments loop
     for _ in tqdm(range(N_envs), desc="Generating dataset"):
+        # Build an environment with obstacles
         n_obs     = int(rng.integers(n_obstacles_range[0], n_obstacles_range[1] + 1))
         obstacles = sample_circular_obstacles(
             n_obstacles=n_obs, r_min=r_range[0], r_max=r_range[1],
@@ -371,6 +412,8 @@ def generate_dataset(
         for _ in range(pairs_per_env):
             n_attempted += 1
 
+            # Find a pair (start, goal) that is collision-free but its straight 
+            # path is blocked
             pair = sample_valid_pair(
                 sdf_tensor, robot, q_min, q_max,
                 grid_length=grid_length, clearance=clearance,
@@ -381,7 +424,8 @@ def generate_dataset(
             if pair is None:
                 n_no_pair += 1
                 continue
-
+            
+            # Apply the CHOMP optimizer
             q_start, q_goal = pair
             q_traj, success = compute_reference_trajectory(
                 q_start, q_goal, sdf_tensor, robot,
@@ -399,6 +443,7 @@ def generate_dataset(
                 n_chomp_failed += 1
                 continue
 
+            # Store successfull samples
             all_sdfs.append(sdf_tensor)
             all_q_starts.append(torch.from_numpy(q_start).float())
             all_q_goals.append(torch.from_numpy(q_goal).float())
@@ -408,6 +453,7 @@ def generate_dataset(
             all_obs_r.append(obstacles.r.copy())
             all_n_obs.append(len(obstacles.r))
 
+    # Print out the quality diagnosis
     N_total = len(all_sdfs)
     print(f"\n{'─' * 48}")
     print(f"  Attempts:           {n_attempted}")
@@ -415,11 +461,12 @@ def generate_dataset(
     print(f"  CHOMP failed:       {n_chomp_failed}")
     print(f"  Successful samples: {N_total}  ({100 * N_total / max(n_attempted, 1):.1f}%)")
     print(f"{'─' * 48}")
-
     if N_total == 0:
         print("WARNING: No data points generated. Check parameters.")
         return {}
 
+    # Obstacle padding as not all of the environments have the same amount
+    # of obstacles
     max_n_obs  = max(all_n_obs)
     obs_padded = torch.zeros(N_total, max_n_obs, 3)
     for i, (x, y, r) in enumerate(zip(all_obs_x, all_obs_y, all_obs_r)):
@@ -428,6 +475,7 @@ def generate_dataset(
         obs_padded[i, :n, 1] = torch.from_numpy(y).float()
         obs_padded[i, :n, 2] = torch.from_numpy(r).float()
 
+    # Stack and save
     dataset = {
         "sdf":         torch.stack(all_sdfs),
         "q_start":     torch.stack(all_q_starts),
@@ -448,7 +496,6 @@ def generate_dataset(
             "q_max":       q_max.tolist() if q_max is not None else None,
         },
     }
-
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     torch.save(dataset, save_path)
     size_mb = os.path.getsize(save_path) / 1e6

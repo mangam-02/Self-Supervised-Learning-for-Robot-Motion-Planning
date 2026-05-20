@@ -1,5 +1,5 @@
 """
-data.py — Environment generation, configuration sampling, CHOMP, dataset assembly.
+data.py — Environment generation, configuration sampling, dataset assembly.
 
 Requires SimpleArm on sys.path before importing this module:
     sys.path.insert(0, "/path/to/SimpleArm/src")
@@ -14,13 +14,7 @@ from tqdm.auto import tqdm
 from simplearm.geom import SquareGrid, SE2, Obstacles
 from simplearm.robot import RobotInfo
 
-from utils import get_world_spheres_torch, query_sdf_differentiable
-from losses import (
-    compute_smoothness_cost,
-    compute_trajectory_collision_cost,
-    compute_joint_limits_cost,
-)
-from models import build_bspline_interpolation_matrix
+from utils import get_world_spheres_torch, query_sdf_differentiable, forward_kinematics_torch
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -104,9 +98,12 @@ def visualize_environment(
     sdf_tensor: torch.Tensor,
     grid_length: float = 2.5,
     ax=None,
+    robot=None,
+    q=None,
 ):
     """
     Plots a single SDF environment (obstacles filled, boundary contoured).
+    If robot and q are provided, the arm configuration is drawn on top.
     """
     sdf = sdf_tensor.squeeze(0).numpy()
     xs  = np.linspace(-grid_length / 2, grid_length / 2, sdf.shape[1])
@@ -121,6 +118,13 @@ def visualize_environment(
     ax.set_xlim(-grid_length / 2, grid_length / 2)
     ax.set_ylim(-grid_length / 2, grid_length / 2)
     ax.grid(True, color="white", linewidth=0.8)
+    if robot is not None and q is not None:
+        q_t    = torch.from_numpy(np.asarray(q, dtype=np.float32)).unsqueeze(0)
+        joints = forward_kinematics_torch(q_t, robot.linklengths)[0].numpy()  # [dof+1, 2]
+        ax.plot(joints[:, 0], joints[:, 1], "o-", color="#2980b9",
+                linewidth=2.5, markersize=5, zorder=5)
+        ax.plot(joints[0, 0],  joints[0, 1],  "s", color="#27ae60", markersize=8,  zorder=6)
+        ax.plot(joints[-1, 0], joints[-1, 1], "*", color="#f39c12", markersize=12, zorder=6)
     if own_fig:
         plt.tight_layout()
         plt.show()
@@ -208,133 +212,6 @@ def sample_valid_pair(
     return None
 
 
-# ── CHOMP ─────────────────────────────────────────────────────────────────────
-
-def compute_reference_trajectory(
-    q_start: np.ndarray,
-    q_goal: np.ndarray,
-    sdf_tensor: torch.Tensor,
-    robot: RobotInfo,
-    T: int = 50,
-    C: int = 10,
-    n_iter: int = 500,
-    lr: float = 0.03,
-    w_smooth: float = 0.001,
-    w_coll: float = 5.0,
-    w_vel: float = 400.0,
-    w_jl: float = 50.0,
-    eps: float = 0.15,
-    v_max: float = 0.10,
-    n_restarts: int = 3,
-    grid_length: float = 2.5,
-    success_threshold: float = 0.02,
-    q_min: np.ndarray = None,
-    q_max: np.ndarray = None,
-) -> tuple[np.ndarray, bool]:
-    """
-    B-spline CHOMP with sinusoidal restarts. Optimizes C-2 interior waypoints with fixed start 
-    and goal endpoints. Sinusoidal perturbations bias restarts toward globally different solutions.
-    A velocity-limit penalty prevents tunneling (arm crossing obstacles between frames).
-
-    Args:
-      w_coll:             Collision weight (normalized by B*T inside compute_trajectory_collision_cost).
-      w_vel:              Velocity limit weight — prevents tunneling.
-      v_max:              Max joint change [rad] per timestep.
-      w_jl:               Joint limit penalty weight (skipped when q_min/q_max are None).
-      success_threshold:  Max fraction of colliding sphere-timestep pairs to count as success.
-
-    Returns:
-      (q_traj [T, dof], success)
-    """
-    # Prepare dimensions
-    q_s = torch.tensor(q_start, dtype=torch.float32)
-    q_g = torch.tensor(q_goal,  dtype=torch.float32)
-    dof = len(q_start)
-    sdf_batch    = sdf_tensor.unsqueeze(0)  # [1, 1, H, W]
-    
-    # B-spline transformation matrix
-    M            = build_bspline_interpolation_matrix(T, C, degree=3)
-    
-    # Initial path: straight line
-    t_inner      = torch.linspace(0, 1, C)[1:-1]
-    straight     = q_s * (1 - t_inner[:, None]) + q_g * t_inner[:, None]
-    
-    # Needed for the restarts
-    sin_envelope = torch.sin(torch.pi * t_inner)
-
-    # Initialiaze parameters
-    q_min_t = torch.tensor(q_min, dtype=torch.float32) if q_min is not None else None
-    q_max_t = torch.tensor(q_max, dtype=torch.float32) if q_max is not None else None
-    best_traj, best_coll_rate = None, float("inf")
-
-    # Restart loop
-    for restart in range(n_restarts):
-        # Start using a straight line
-        if restart == 0:
-            init = straight.clone()
-        
-        # Escaping plan
-        else:
-            # Apply the sin envelope in a random direction
-            direction    = torch.randn(dof)
-            direction    = direction / (direction.norm() + 1e-8)
-            amplitude    = 0.6 * restart
-            perturbation = amplitude * sin_envelope[:, None] * direction[None, :]
-            init         = straight + perturbation
-
-        # Track the q_inner evolution for the gradients
-        q_inner = init.detach().clone().requires_grad_(True)
-        
-        # Optimizer configuration
-        opt     = torch.optim.Adam([q_inner], lr=lr)
-
-        # Optimization loop
-        for _ in range(n_iter):
-            # Delete previous gradients
-            opt.zero_grad()
-
-            # Generate the full trajectory
-            waypoints = torch.cat([q_s.unsqueeze(0), q_inner, q_g.unsqueeze(0)], dim=0)
-            q_traj    = M @ waypoints  # [T, dof]
-
-            # Compute the losses
-            loss_smooth = compute_smoothness_cost(q_traj.unsqueeze(0), dt=1.0, weight=w_smooth)
-            loss_coll   = compute_trajectory_collision_cost(
-                q_traj.unsqueeze(0), sdf_batch, robot,
-                grid_length=grid_length, eps=eps, weight=w_coll,
-            )
-            vel      = q_traj[1:] - q_traj[:-1]
-            loss_vel = w_vel * torch.relu(vel.abs() - v_max).pow(2).sum()
-            loss_jl  = (
-                compute_joint_limits_cost(q_traj, q_min_t, q_max_t, weight=w_jl)
-                if q_min_t is not None else 0.0
-            )
-
-            # Backward propagation and update
-            (loss_smooth + loss_coll + loss_vel + loss_jl).backward()
-            opt.step()
-
-        # Stop gradient computation and obtain the final optimized trajectory
-        with torch.no_grad():
-            wp      = torch.cat([q_s.unsqueeze(0), q_inner, q_g.unsqueeze(0)], dim=0)
-            q_final = M @ wp  # [T, dof]
-        
-        # Obtain the distances from the robot to the obstacles
-        sdf_hw    = sdf_tensor.squeeze(0)
-        spheres   = get_world_spheres_torch(q_final, robot)
-        dists     = query_sdf_differentiable(sdf_hw, spheres.reshape(-1, 2), grid_length)
-        
-        # Calculate the collision rate and compare with previous restarts to
-        # keep the best one
-        coll_rate = (dists < 0).float().mean().item()
-        if coll_rate < best_coll_rate:
-            best_coll_rate = coll_rate
-            best_traj      = q_final.numpy()
-
-    # Return the best trajectory and if it surpasses the success threshold
-    return best_traj, best_coll_rate <= success_threshold
-
-
 # ── Dataset assembly ──────────────────────────────────────────────────────────
 
 def generate_dataset(
@@ -352,18 +229,6 @@ def generate_dataset(
     require_nontrivial: bool = True,
     n_check_midpoints: int = 9,
     max_pair_tries: int = 300,
-    T: int = 50,
-    C: int = 10,
-    chomp_n_iter: int = 500,
-    chomp_lr: float = 0.03,
-    chomp_w_smooth: float = 0.001,
-    chomp_w_coll: float = 15.0,
-    chomp_w_vel: float = 400.0,
-    chomp_w_jl: float = 50.0,
-    chomp_eps: float = 0.15,
-    chomp_v_max: float = 0.10,
-    chomp_n_restarts: int = 3,
-    success_threshold: float = 0.02,
     grid_length: float = 2.5,
     n_vox: int = 128,
     seed: int = 42,
@@ -377,14 +242,11 @@ def generate_dataset(
       3. Sample pairs_per_env valid (q_start, q_goal) pairs:
            - Both endpoints collision-free with clearance >= sphere_rad.
            - Straight joint-space line is blocked (non-trivial filter).
-      4. Run CHOMP to produce a reference trajectory.
-      5. Accept only trajectories with collision rate < success_threshold.
 
     Dataset fields:
       sdf:         [N, 1, H, W]     SDF grids
       q_start:     [N, dof]         Start joint configurations
       q_goal:      [N, dof]         Goal joint configurations
-      q_traj:      [N, T, dof]      CHOMP reference trajectories (labels)
       obstacles:   [N, max_obs, 3]  Obstacle (x, y, r), zero-padded
       n_obstacles: [N]              Actual obstacle count per sample
       metadata:    dict             Robot, grid, and joint-limit parameters
@@ -395,9 +257,9 @@ def generate_dataset(
     rng = np.random.default_rng(seed) # Random seed fixed
 
     # Define empty containers
-    all_sdfs, all_q_starts, all_q_goals, all_trajs = [], [], [], []
-    all_obs_x, all_obs_y, all_obs_r, all_n_obs    = [], [], [], []
-    n_attempted, n_no_pair, n_chomp_failed         = 0, 0, 0
+    all_sdfs, all_q_starts, all_q_goals = [], [], []
+    all_obs_x, all_obs_y, all_obs_r, all_n_obs = [], [], [], []
+    n_attempted, n_no_pair = 0, 0
 
     #Environments loop
     for _ in tqdm(range(N_envs), desc="Generating dataset"):
@@ -412,7 +274,7 @@ def generate_dataset(
         for _ in range(pairs_per_env):
             n_attempted += 1
 
-            # Find a pair (start, goal) that is collision-free but its straight 
+            # Find a pair (start, goal) that is collision-free but its straight
             # path is blocked
             pair = sample_valid_pair(
                 sdf_tensor, robot, q_min, q_max,
@@ -424,30 +286,12 @@ def generate_dataset(
             if pair is None:
                 n_no_pair += 1
                 continue
-            
-            # Apply the CHOMP optimizer
-            q_start, q_goal = pair
-            q_traj, success = compute_reference_trajectory(
-                q_start, q_goal, sdf_tensor, robot,
-                T=T, C=C,
-                n_iter=chomp_n_iter, lr=chomp_lr,
-                w_smooth=chomp_w_smooth, w_coll=chomp_w_coll,
-                w_vel=chomp_w_vel, w_jl=chomp_w_jl,
-                eps=chomp_eps, v_max=chomp_v_max,
-                n_restarts=chomp_n_restarts,
-                grid_length=grid_length,
-                success_threshold=success_threshold,
-                q_min=q_min, q_max=q_max,
-            )
-            if not success:
-                n_chomp_failed += 1
-                continue
 
             # Store successfull samples
+            q_start, q_goal = pair
             all_sdfs.append(sdf_tensor)
             all_q_starts.append(torch.from_numpy(q_start).float())
             all_q_goals.append(torch.from_numpy(q_goal).float())
-            all_trajs.append(torch.from_numpy(q_traj).float())
             all_obs_x.append(obstacles.x.copy())
             all_obs_y.append(obstacles.y.copy())
             all_obs_r.append(obstacles.r.copy())
@@ -458,7 +302,6 @@ def generate_dataset(
     print(f"\n{'─' * 48}")
     print(f"  Attempts:           {n_attempted}")
     print(f"  No valid pair:      {n_no_pair}")
-    print(f"  CHOMP failed:       {n_chomp_failed}")
     print(f"  Successful samples: {N_total}  ({100 * N_total / max(n_attempted, 1):.1f}%)")
     print(f"{'─' * 48}")
     if N_total == 0:
@@ -480,13 +323,10 @@ def generate_dataset(
         "sdf":         torch.stack(all_sdfs),
         "q_start":     torch.stack(all_q_starts),
         "q_goal":      torch.stack(all_q_goals),
-        "q_traj":      torch.stack(all_trajs),
         "obstacles":   obs_padded,
         "n_obstacles": torch.tensor(all_n_obs, dtype=torch.long),
         "metadata": {
             "N":           N_total,
-            "T":           T,
-            "C":           C,
             "grid_length": grid_length,
             "n_vox":       n_vox,
             "dof":         robot.n_dof,

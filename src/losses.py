@@ -59,13 +59,9 @@ def compute_trajectory_joint_limits_cost(q_traj, q_min, q_max, weight=1.0):
     q_traj:    [B, T, dof]
     q_min/q_max: Tensors with the robot's joint limits.
     """
-    # Initialize the cost
-    total_cost = 0
-
-    # Compute the cost for each step
-    for t in range(q_traj.shape[1]):
-        total_cost += compute_joint_limits_cost(q_traj[:, t], q_min, q_max, weight=weight / q_traj.shape[1])
-    return total_cost
+    lower_violation = torch.clamp(q_min - q_traj, min=0)
+    upper_violation = torch.clamp(q_traj - q_max, min=0)
+    return weight * torch.sum(lower_violation ** 2 + upper_violation ** 2) / q_traj.shape[1]
 
 def compute_trajectory_collision_cost(q_traj, sdf_batch, robot_info,
                                       grid_length=2.5, eps=0.1, weight=1.0):

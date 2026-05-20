@@ -309,6 +309,7 @@ def generate_dataset(
     n_vox: int = 128,
     seed: int = 42,
     save_path: str = "data/training_dataset.pt",
+    split: tuple[float, float, float] | None = None,
 ) -> dict:
     """
     Full data generation pipeline for the WarmStartPlanner. For each of N_envs
@@ -395,25 +396,85 @@ def generate_dataset(
         obs_padded[i, :n, 2] = torch.from_numpy(r).float()
 
     # Stack and save
+    metadata = {
+        "N":           N_total,
+        "grid_length": grid_length,
+        "n_vox":       n_vox,
+        "dof":         robot.n_dof,
+        "linklengths": list(robot.linklengths),
+        "sphere_rad":  sphere_rad,
+        "q_min":       q_min.tolist() if q_min is not None else None,
+        "q_max":       q_max.tolist() if q_max is not None else None,
+    }
     dataset = {
         "sdf":         torch.stack(all_sdfs),
         "q_start":     torch.stack(all_q_starts),
         "q_goal":      torch.stack(all_q_goals),
         "obstacles":   obs_padded,
         "n_obstacles": torch.tensor(all_n_obs, dtype=torch.long),
-        "metadata": {
-            "N":           N_total,
-            "grid_length": grid_length,
-            "n_vox":       n_vox,
-            "dof":         robot.n_dof,
-            "linklengths": list(robot.linklengths),
-            "sphere_rad":  sphere_rad,
-            "q_min":       q_min.tolist() if q_min is not None else None,
-            "q_max":       q_max.tolist() if q_max is not None else None,
-        },
+        "metadata":    metadata,
     }
+
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    torch.save(dataset, save_path)
-    size_mb = os.path.getsize(save_path) / 1e6
-    print(f"  Saved: {save_path}  ({size_mb:.1f} MB)")
+
+    if split is None:
+        torch.save(dataset, save_path)
+        size_mb = os.path.getsize(save_path) / 1e6
+        print(f"  Saved: {save_path}  ({size_mb:.1f} MB)")
+    else:
+        assert abs(sum(split) - 1.0) < 1e-6, "split fractions must sum to 1.0"
+        train_frac, val_frac, _ = split
+        idx = torch.randperm(N_total, generator=torch.Generator().manual_seed(seed))
+        n_train = int(N_total * train_frac)
+        n_val   = int(N_total * val_frac)
+        splits = {
+            "train": idx[:n_train],
+            "val":   idx[n_train:n_train + n_val],
+            "test":  idx[n_train + n_val:],
+        }
+        base, ext = os.path.splitext(save_path)
+        for name, indices in splits.items():
+            subset = {
+                "sdf":         dataset["sdf"][indices],
+                "q_start":     dataset["q_start"][indices],
+                "q_goal":      dataset["q_goal"][indices],
+                "obstacles":   dataset["obstacles"][indices],
+                "n_obstacles": dataset["n_obstacles"][indices],
+                "metadata":    {**metadata, "N": len(indices)},
+            }
+            path = f"{base}_{name}{ext}"
+            torch.save(subset, path)
+            size_mb = os.path.getsize(path) / 1e6
+            print(f"  Saved: {path}  ({len(indices)} samples, {size_mb:.1f} MB)")
+
     return dataset
+
+
+def print_dataset_stats(dataset: dict | str, n_collision_check: int = 100):
+    """
+    Print dataset statistics and a start-config collision sanity check.
+    dataset: either a loaded dataset dict or a path to a .pt file.
+    """
+    if isinstance(dataset, str):
+        dataset = torch.load(dataset, weights_only=False)
+
+    meta        = dataset["metadata"]
+    N           = meta["N"]
+    grid_length = meta["grid_length"]
+    robot       = RobotInfo.from_linklengths(meta["linklengths"], sphere_rad=meta["sphere_rad"])
+
+    print(f"Dataset: {N} samples")
+    for key in ("sdf", "q_start", "q_goal", "obstacles", "n_obstacles"):
+        print(f"  {key:<12} {tuple(dataset[key].shape)}")
+    print(f"\nMetadata: {meta}")
+
+    n_check = min(N, n_collision_check)
+    coll_rates = []
+    for i in range(n_check):
+        sdf_i   = dataset["sdf"][i, 0]
+        spheres = get_world_spheres_torch(dataset["q_start"][i:i+1], robot)
+        dist    = query_sdf_differentiable(sdf_i, spheres.reshape(-1, 2), grid_length)
+        coll_rates.append((dist < 0).float().mean().item())
+
+    print(f"\nStart-config collision rate (first {n_check} samples): "
+          f"mean={np.mean(coll_rates):.3f}  (should be ~0.0)")

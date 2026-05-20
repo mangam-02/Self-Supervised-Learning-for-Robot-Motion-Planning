@@ -28,6 +28,10 @@ def train(
     # Model
     T: int = 50,
     C: int = 10,
+    # Pre-trained encoders
+    env_encoder_path: str | None = None,
+    state_encoder_path: str | None = None,
+    freeze_encoders: bool = False,
     # Training
     n_epochs: int = 2000,
     batch_size: int = 32,
@@ -79,8 +83,29 @@ def train(
         val_q_goal  = val_ds["q_goal"].to(device)
 
     # ── Model & optimizer ────────────────────────────────────────────────────
-    model     = WarmStartPlanner(dof=dof, T=T, C=C, linklengths=meta["linklengths"]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model = WarmStartPlanner(dof=dof, T=T, C=C, linklengths=meta["linklengths"]).to(device)
+
+    if env_encoder_path is not None:
+        model.env_encoder.load_state_dict(
+            torch.load(env_encoder_path, map_location=device, weights_only=True)
+        )
+        print(f"Loaded env encoder:   {env_encoder_path}")
+        if freeze_encoders:
+            for p in model.env_encoder.parameters():
+                p.requires_grad_(False)
+
+    if state_encoder_path is not None:
+        model.state_encoder.load_state_dict(
+            torch.load(state_encoder_path, map_location=device, weights_only=True)
+        )
+        print(f"Loaded state encoder: {state_encoder_path}")
+        if freeze_encoders:
+            for p in model.state_encoder.parameters():
+                p.requires_grad_(False)
+
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    )
 
     def compute_losses(waypoints, sdf_batch):
         traj = model.trajectory(waypoints)          # [B, T, dof] — full B-spline

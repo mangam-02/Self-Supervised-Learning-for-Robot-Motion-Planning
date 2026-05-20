@@ -41,13 +41,22 @@ def compute_collision_cost(distances, eps=0.1, weight=1.0):
     # Case 2: The point is in the danger zone
     cost_danger  = 0.5 * (distances - eps) ** 2 / eps
 
-     # Case 3: The point is in a safe position
+    # Case 3: The point is in a safe position
     cost_safe    = torch.zeros_like(distances)
 
     # Combine the cases
     cost = torch.where(distances < 0, cost_inside,
            torch.where(distances <= eps, cost_danger, cost_safe))
-    return weight * cost.sum()
+
+    # Exponential repulsion: provides nonzero gradient even in the safe zone so
+    # that smoothness/velocity terms cannot silently push the trajectory into
+    # obstacles without opposition. Decays with distance, so it stays small far
+    # from obstacles and doesn't dominate the other cost terms.
+    # gradient w.r.t. d: -0.5 * exp(-d/eps) — always negative → always pushes
+    # trajectory away from obstacles regardless of which zone it is in.
+    repulsion = (eps * 0.5) * torch.exp(-distances.clamp(min=0) / eps)
+
+    return weight * (cost + repulsion).sum()
 
 def compute_trajectory_joint_limits_cost(q_traj, q_min, q_max, weight=1.0):
     """

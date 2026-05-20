@@ -130,6 +130,82 @@ def visualize_environment(
         plt.show()
 
 
+def browse_dataset(
+    dataset: dict,
+    grid_length: float = 2.5,
+    start_idx: int | None = None,
+) -> None:
+    """
+    Interactive dataset browser with Prev / Next buttons to navigate samples.
+    Starts at a random index when start_idx is None.
+    Requires ipywidgets (pip install ipywidgets) and a Jupyter environment.
+    """
+    import io
+    import ipywidgets as widgets
+    from IPython.display import display
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    N = dataset["metadata"]["N"]
+    robot = RobotInfo.from_linklengths(
+        dataset["metadata"]["linklengths"],
+        sphere_rad=dataset["metadata"]["sphere_rad"],
+    )
+
+    # Mutable index stored in a list so the callbacks can update it
+    idx = [int(torch.randint(0, N, (1,)).item()) if start_idx is None else int(start_idx)]
+
+    btn_prev   = widgets.Button(description="◄ Prev", layout=widgets.Layout(width="100px"))
+    btn_next   = widgets.Button(description="Next ►", layout=widgets.Layout(width="100px"))
+    info_label = widgets.HTML()
+    img_widget = widgets.Image(format="png")
+
+    def render():
+        i          = idx[0]
+        q_start_np = dataset["q_start"][i].numpy()
+        q_goal_np  = dataset["q_goal"][i].numpy()
+        n_obs      = dataset["n_obstacles"][i].item()
+        sdf_sample = dataset["sdf"][i]
+
+        # Overwrite label value in-place — no Output widget, no accumulation
+        info_label.value = (
+            f"<b>Sample {i} / {N - 1}</b> &nbsp;|&nbsp; obstacles: {n_obs}<br>"
+            f"&nbsp;&nbsp;q_start: {np.round(q_start_np, 3)}<br>"
+            f"&nbsp;&nbsp;q_goal:&nbsp; {np.round(q_goal_np, 3)}"
+        )
+
+        # Render figure to PNG bytes via Agg — bypasses all pyplot display hooks
+        fig = Figure(figsize=(10, 5))
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(1, 2)
+        for ax, q, title in zip(axes, [q_start_np, q_goal_np], ["q_start", "q_goal"]):
+            visualize_environment(sdf_sample, grid_length, ax=ax, robot=robot, q=q)
+            ax.set_title(title)
+        fig.suptitle(f"Sample {i} / {N - 1}", fontsize=13)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        img_widget.value = buf.getvalue()
+
+    def on_prev(_):
+        idx[0] = (idx[0] - 1) % N
+        render()
+
+    def on_next(_):
+        idx[0] = (idx[0] + 1) % N
+        render()
+
+    btn_prev.on_click(on_prev)
+    btn_next.on_click(on_next)
+
+    render()
+    display(widgets.VBox([
+        widgets.HBox([btn_prev, btn_next]),
+        info_label,
+        img_widget,
+    ]))
+
+
 # ── Configuration sampling ────────────────────────────────────────────────────
 
 def is_collision_free(

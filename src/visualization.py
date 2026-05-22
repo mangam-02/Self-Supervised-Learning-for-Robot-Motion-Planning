@@ -1,5 +1,6 @@
 import io
 import contextlib
+from PIL import Image
 import numpy as np
 import torch
 import plotly.graph_objects as go
@@ -135,3 +136,33 @@ def browse_trajectories(
         info_label,
         out,
     ]))
+
+
+
+
+def save_viewer_as_gif(viewer, path, duration_ms=120, size=600):
+    """Speichert einen animierten RobotViewer als GIF."""
+    images = []
+    for pf in viewer.fig.frames:
+        tmp = go.Figure(data=pf.data, layout=viewer.fig.layout)
+        tmp.update_layout(
+            updatemenus=[],
+            sliders=[],
+            margin=dict(l=10, r=10, t=10, b=10),
+            width=size,
+            height=size,
+        )
+        png = tmp.to_image(format="png", width=size, height=size, engine="kaleido")
+        images.append(Image.open(io.BytesIO(png)))
+
+    images[0].save(
+        path,
+        save_all=True,
+        append_images=images[1:],
+        loop=0,
+        duration=duration_ms,
+        optimize=False,
+    )
+    print(f"GIF gespeichert: {path}")
+
+

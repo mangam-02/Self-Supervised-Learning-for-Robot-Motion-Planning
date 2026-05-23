@@ -318,6 +318,7 @@ def generate_dataset(
     seed: int = 42,
     save_path: str = "data/training_dataset.pt",
     split: tuple[float, float, float] | None = None,
+    fixed_pair: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict:
     """
     Full data generation pipeline for the WarmStartPlanner. For each of N_envs
@@ -327,6 +328,11 @@ def generate_dataset(
       3. Sample pairs_per_env valid (q_start, q_goal) pairs:
            - Both endpoints collision-free with clearance >= sphere_rad.
            - Straight joint-space line is blocked (non-trivial filter).
+
+    fixed_pair: optional (q_start, q_goal) tuple of np.ndarrays. When set, the same
+        robot configuration is reused for every environment instead of sampling new
+        pairs. Environments where the fixed pair is in collision or trivial are skipped.
+        Useful for isolating the effect of different obstacle layouts on a fixed task.
 
     Dataset fields:
       sdf:         [N, 1, H, W]     SDF grids
@@ -357,18 +363,30 @@ def generate_dataset(
         )
         sdf_tensor = build_sdf_tensor(obstacles, grid_length, n_vox)
 
-        for _ in range(pairs_per_env):
+        n_pairs = 1 if fixed_pair is not None else pairs_per_env
+        for _ in range(n_pairs):
             n_attempted += 1
 
-            # Find a pair (start, goal) that is collision-free but its straight
-            # path is blocked
-            pair = sample_valid_pair(
-                sdf_tensor, robot, q_min, q_max,
-                grid_length=grid_length, clearance=clearance,
-                require_nontrivial=require_nontrivial,
-                n_check_midpoints=n_check_midpoints,
-                max_tries=max_pair_tries, rng=rng,
-            )
+            if fixed_pair is not None:
+                # Validate the fixed pair for this environment — skip if in collision or trivial
+                q_s, q_g = fixed_pair
+                valid = (
+                    is_collision_free(q_s, sdf_tensor, robot, grid_length, clearance)
+                    and is_collision_free(q_g, sdf_tensor, robot, grid_length, clearance)
+                    and (not require_nontrivial or straight_line_blocked(
+                        q_s, q_g, sdf_tensor, robot, grid_length, n_check_midpoints))
+                )
+                pair = fixed_pair if valid else None
+            else:
+                # Find a pair (start, goal) that is collision-free but its straight
+                # path is blocked
+                pair = sample_valid_pair(
+                    sdf_tensor, robot, q_min, q_max,
+                    grid_length=grid_length, clearance=clearance,
+                    require_nontrivial=require_nontrivial,
+                    n_check_midpoints=n_check_midpoints,
+                    max_tries=max_pair_tries, rng=rng,
+                )
             if pair is None:
                 n_no_pair += 1
                 continue

@@ -52,6 +52,8 @@ def train(
     log_every: int = 100,
     device: str | None = None,
     save_path: str | None = None,
+    save_env_encoder_path: str | None = None,
+    save_state_encoder_path: str | None = None,
 ) -> tuple[WarmStartPlanner, dict]:
     """
     Train a WarmStartPlanner on a pre-generated dataset.
@@ -198,6 +200,14 @@ def train(
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         torch.save(model.state_dict(), save_path)
         print(f"Model saved: {save_path}")
+    if save_env_encoder_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_env_encoder_path)), exist_ok=True)
+        torch.save(model.env_encoder.state_dict(), save_env_encoder_path)
+        print(f"Env encoder saved: {save_env_encoder_path}")
+    if save_state_encoder_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_state_encoder_path)), exist_ok=True)
+        torch.save(model.state_encoder.state_dict(), save_state_encoder_path)
+        print(f"State encoder saved: {save_state_encoder_path}")
 
     return model, history
 

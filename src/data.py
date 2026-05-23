@@ -52,25 +52,29 @@ def sample_circular_obstacles(
     r_min: float = 0.06,
     r_max: float = 0.18,
     workspace_radius: float = 1.0,
+    dist_from_origin: tuple[float, float] | None = None,
     min_separation: float = 0.05,
     rng: np.random.Generator = None,
     max_tries: int = 300,
 ) -> Obstacles:
     """
     Samples n_obstacles circular obstacles within the robot workspace.
-    Obstacles are placed via polar coordinates (r in [0.15, 0.85*workspace_radius])
-    so they always lie within the robot's reachable area. A minimum surface-to-surface
-    separation is enforced to keep paths feasible.
+    Obstacles are placed via polar coordinates so they always lie within the
+    robot's reachable area. A minimum surface-to-surface separation is enforced
+    to keep paths feasible.
+
+    dist_from_origin: (min_dist, max_dist) from origin. Defaults to (0.15, 0.85*workspace_radius).
     """
     if rng is None:
         rng = np.random.default_rng()
+    d_min, d_max = dist_from_origin if dist_from_origin is not None else (0.15, workspace_radius * 0.85)
 
     positions, radii = [], []
     for _ in range(n_obstacles):
         for _ in range(max_tries):
             # Polar coordinates to guarantee that the obstacles are created within
             # the workspace
-            r     = rng.uniform(0.15, workspace_radius * 0.85)
+            r     = rng.uniform(d_min, d_max)
             theta = rng.uniform(0, 2 * np.pi)
             x, y  = r * np.cos(theta), r * np.sin(theta)
             rad   = rng.uniform(r_min, r_max)
@@ -145,6 +149,9 @@ def browse_dataset(
     from IPython.display import display
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    if isinstance(dataset, str):
+        dataset = torch.load(dataset, weights_only=False)
 
     N = dataset["metadata"]["N"]
     robot = RobotInfo.from_linklengths(
@@ -300,6 +307,7 @@ def generate_dataset(
     n_obstacles_range: tuple[int, int] = (1, 4),
     r_range: tuple[float, float] = (0.06, 0.18),
     workspace_radius: float = 1.0,
+    dist_from_origin: tuple[float, float] | None = None,
     min_separation: float = 0.05,
     clearance: float = None,
     require_nontrivial: bool = True,
@@ -344,7 +352,8 @@ def generate_dataset(
         n_obs     = int(rng.integers(n_obstacles_range[0], n_obstacles_range[1] + 1))
         obstacles = sample_circular_obstacles(
             n_obstacles=n_obs, r_min=r_range[0], r_max=r_range[1],
-            workspace_radius=workspace_radius, min_separation=min_separation, rng=rng,
+            workspace_radius=workspace_radius, dist_from_origin=dist_from_origin,
+            min_separation=min_separation, rng=rng,
         )
         sdf_tensor = build_sdf_tensor(obstacles, grid_length, n_vox)
 

@@ -10,6 +10,7 @@ from simplearm.geom import Obstacles
 from simplearm.viz import RobotViewer
 
 from models import WarmStartPlanner
+from losses import compute_trajectory_max_collision_cost, compute_trajectory_joint_limits_cost
 
 
 def _load(dataset: dict | str) -> dict:
@@ -42,6 +43,7 @@ def browse_trajectories(
     device: str | None = None,
     start_idx: int = 0,
     animate: bool = True,
+    save_name: str | None = None,
 ) -> None:
     """
     Interactive browser that runs the model on each dataset sample and
@@ -67,15 +69,22 @@ def browse_trajectories(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model   = _load_model(model, dof=ds["metadata"]["dof"], device=device, linklengths=ds["metadata"]["linklengths"])
+    meta    = ds["metadata"]
+    model   = _load_model(model, dof=meta["dof"], device=device, linklengths=meta["linklengths"])
     sdf     = ds["sdf"].to(device)
     q_start = ds["q_start"].to(device)
     q_goal  = ds["q_goal"].to(device)
+    q_min   = torch.tensor(meta["q_min"], dtype=torch.float32, device=device)
+    q_max   = torch.tensor(meta["q_max"], dtype=torch.float32, device=device)
 
-    idx = [int(start_idx) % N]
+    idx      = [int(start_idx) % N]
+    state    = {"viz": None, "cost_fig": None}   # keep last render for saving
 
-    btn_prev   = widgets.Button(description="◄ Prev", layout=widgets.Layout(width="100px"))
-    btn_next   = widgets.Button(description="Next ►", layout=widgets.Layout(width="100px"))
+    btn_prev   = widgets.Button(description="◄ Prev",   layout=widgets.Layout(width="100px"))
+    btn_next   = widgets.Button(description="Next ►",   layout=widgets.Layout(width="100px"))
+    btn_save   = widgets.Button(description="💾 Save",  layout=widgets.Layout(width="100px"),
+                                button_style="info")
+    save_dir   = widgets.Text(value="resources", description="Dir:", layout=widgets.Layout(width="200px"))
     info_label = widgets.HTML()
     out        = widgets.Output()
 
@@ -105,7 +114,7 @@ def browse_trajectories(
             f"&nbsp;&nbsp;q_goal:&nbsp; {np.round(q_g_np, 3)}"
         )
 
-        # Build figure: suppress spinner text output and internal fig.show()
+        # Build robot figure
         viz = RobotViewer(q_traj_np, robot, obstacles=obstacles_viz, animate=animate)
         _orig_show = go.Figure.show
         go.Figure.show = lambda *a, **kw: None
@@ -115,9 +124,50 @@ def browse_trajectories(
         finally:
             go.Figure.show = _orig_show
 
+        # Per-timestep cost plot
+        with torch.no_grad():
+            _, coll_per_step   = compute_trajectory_max_collision_cost(
+                traj, sdf[i:i+1], robot,
+                grid_length=meta["grid_length"], eps=meta.get("collision_eps", 0.1),
+                return_per_step=True,
+            )
+            _, joints_per_step = compute_trajectory_joint_limits_cost(
+                traj, q_min, q_max, return_per_step=True,
+            )
+            coll_costs   = coll_per_step.squeeze(0).cpu().numpy()
+            joints_costs = joints_per_step.squeeze(0).cpu().numpy()
+
+        T = len(coll_costs)
+        timesteps = np.arange(T)
+        cost_fig = go.Figure()
+        cost_fig.add_trace(go.Scatter(
+            x=timesteps, y=coll_costs,
+            name="Collision (max sphere)", line=dict(color="red"),
+        ))
+        cost_fig.add_trace(go.Scatter(
+            x=timesteps, y=joints_costs,
+            name="Joint limits", line=dict(color="orange"),
+        ))
+        cost_fig.update_layout(
+            title=f"Cost per timestep — sample {i}",
+            xaxis_title="Timestep",
+            yaxis_title="Cost",
+            height=250,
+            margin=dict(l=40, r=20, t=40, b=40),
+            legend=dict(orientation="h", y=1.15),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+        )
+        cost_fig.update_xaxes(showgrid=True, gridcolor="lightgrey")
+        cost_fig.update_yaxes(showgrid=True, gridcolor="lightgrey")
+
+        state["viz"]      = viz
+        state["cost_fig"] = cost_fig
+
         out.clear_output(wait=True)
         with out:
             display(viz.fig)
+            display(cost_fig)
 
     def on_prev(_):
         idx[0] = (idx[0] - 1) % N
@@ -127,12 +177,27 @@ def browse_trajectories(
         idx[0] = (idx[0] + 1) % N
         render()
 
+    def on_save(_):
+        import os
+        d   = save_dir.value.strip() or "resources"
+        os.makedirs(d, exist_ok=True)
+        i   = idx[0]
+        gif_path  = os.path.join(d, f"{save_name}_trajectory_{i}.gif")
+        cost_path = os.path.join(d, f"{save_name}_cost_{i}.png")
+        with out:
+            if state["viz"] is not None:
+                save_viewer_as_gif(state["viz"], gif_path)
+            if state["cost_fig"] is not None:
+                state["cost_fig"].write_image(cost_path, engine="kaleido", scale=3)
+                print(f"Cost plot saved: {cost_path}")
+
     btn_prev.on_click(on_prev)
     btn_next.on_click(on_next)
+    btn_save.on_click(on_save)
 
     render()
     display(widgets.VBox([
-        widgets.HBox([btn_prev, btn_next]),
+        widgets.HBox([btn_prev, btn_next, btn_save, save_dir]),
         info_label,
         out,
     ]))
@@ -141,7 +206,7 @@ def browse_trajectories(
 
 
 def save_viewer_as_gif(viewer, path, duration_ms=120, size=600):
-    """Speichert einen animierten RobotViewer als GIF."""
+    """Save an animated RobotViewer as a GIF file."""
     images = []
     for pf in viewer.fig.frames:
         tmp = go.Figure(data=pf.data, layout=viewer.fig.layout)

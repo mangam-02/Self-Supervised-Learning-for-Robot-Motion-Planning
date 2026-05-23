@@ -176,9 +176,6 @@ class WaypointDecoder(nn.Module):
     """
     def __init__(self, latent_env=64, latent_state=64, C=10, dof=3):
         super().__init__()
-        # Expand the environment and robot information into 256 neurons
-        # and then convert them into the joint angles for the interior
-        # waypoints
         self.C = C
         self.dof = dof
         self.mlp = nn.Sequential(
@@ -186,9 +183,11 @@ class WaypointDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(256, (C - 2) * dof),
         )
+        # Zero-init output layer so initial offsets are 0 → trajectory starts as straight line
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, z_env, z_state):
-        # Data flow
         return self.mlp(torch.cat([z_env, z_state], dim=-1)).view(-1, self.C - 2, self.dof)
 
 
@@ -229,7 +228,13 @@ class WarmStartPlanner(nn.Module):
     def forward(self, q_start, q_goal, sdf):
         """Returns C waypoints [B, C, dof] — use .trajectory() to get the full B-spline."""
         state = self._state_features(q_start, q_goal)
-        inner = self.decoder(self.env_encoder(sdf), self.state_encoder(state))
+        offset = self.decoder(self.env_encoder(sdf), self.state_encoder(state))
+
+        # Linear interpolation as baseline — offset=0 means straight-line trajectory
+        t_vals = torch.linspace(0, 1, self.C, device=q_start.device)[1:-1]  # [C-2]
+        baseline = q_start.unsqueeze(1) + t_vals.view(1, -1, 1) * (q_goal - q_start).unsqueeze(1)
+        inner = baseline + offset
+
         return torch.cat([q_start.unsqueeze(1), inner, q_goal.unsqueeze(1)], dim=1)
 
     def trajectory(self, waypoints):

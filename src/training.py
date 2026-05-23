@@ -10,9 +10,11 @@ from simplearm.robot import RobotInfo
 from models import WarmStartPlanner, StateAutoEncoder, EnvAutoEncoder
 from losses import (
     compute_trajectory_collision_cost,
+    compute_trajectory_max_collision_cost,
     compute_trajectory_joint_limits_cost,
-    compute_trajectory_velocity_cost,
     compute_smoothness_cost,
+    compute_waypoint_spacing_cost,
+    compute_exploration_cost,
 )
 
 
@@ -40,7 +42,9 @@ def train(
     w_coll: float = 1.0,
     w_joints: float = 0.1,
     w_smooth: float = 0.01,
-    w_velocity: float = 0.1,
+    w_spacing: float = 0.1,
+    w_explore: float = 0.1,
+    explore_threshold: float = 0.5,
     # Loss parameters
     collision_eps: float = 0.1,
     dt: float = 0.1,
@@ -67,9 +71,9 @@ def train(
     robot       = RobotInfo.from_linklengths(meta["linklengths"], sphere_rad=meta["sphere_rad"])
     q_min       = torch.tensor(meta["q_min"], dtype=torch.float32, device=device)
     q_max       = torch.tensor(meta["q_max"], dtype=torch.float32, device=device)
-    # Joint 0 is a continuous revolute joint with no physical limits — exclude it
-    q_min[0]    = float("-inf")
-    q_max[0]    = float("inf")
+    # Joint 0 is continuous but we bound it to [-2π, 2π] for planning purposes
+    q_min[0]    = -2 * torch.pi
+    q_max[0]    =  2 * torch.pi
     dof         = meta["dof"]
 
     sdf     = train_ds["sdf"].to(device)
@@ -107,13 +111,15 @@ def train(
         filter(lambda p: p.requires_grad, model.parameters()), lr=lr
     )
 
-    def compute_losses(waypoints, sdf_batch):
-        traj = model.trajectory(waypoints)          # [B, T, dof] — full B-spline
-        l_coll  = compute_trajectory_collision_cost(traj, sdf_batch, robot, grid_length=grid_length, eps=collision_eps, weight=w_coll)
-        l_joint = compute_trajectory_joint_limits_cost(traj, q_min, q_max, weight=w_joints)
-        l_vel   = compute_trajectory_velocity_cost(traj, dt=dt, weight=w_velocity)
-        l_smooth= compute_smoothness_cost(traj, dt=dt, weight=w_smooth)
-        return l_coll + l_joint + l_vel + l_smooth, l_coll, l_joint, l_vel, l_smooth
+    def compute_losses(waypoints, sdf_batch, q_s, q_g):
+        traj      = model.trajectory(waypoints)     # [B, T, dof] — full B-spline
+        l_coll    = compute_trajectory_max_collision_cost(traj, sdf_batch, robot, grid_length=grid_length, eps=collision_eps, weight=w_coll)
+        l_joint   = compute_trajectory_joint_limits_cost(traj, q_min, q_max, weight=w_joints)
+        l_smooth  = compute_smoothness_cost(traj, dt=dt, weight=w_smooth)
+        l_space   = compute_waypoint_spacing_cost(waypoints, weight=w_spacing)
+        l_explore = compute_exploration_cost(waypoints, q_s, q_g, l_coll.detach(),
+                                             threshold=explore_threshold, weight=w_explore)
+        return l_coll + l_joint + l_smooth + l_space + l_explore, l_coll, l_joint, l_smooth, l_space, l_explore
 
     # ── Loss scale diagnostics ────────────────────────────────────────────────
     model.eval()
@@ -121,12 +127,13 @@ def train(
         _wp   = model(q_start[:min(batch_size, N)], q_goal[:min(batch_size, N)], sdf[:min(batch_size, N)])
         _traj = model.trajectory(_wp)
         _raw  = {
-            "coll":   compute_trajectory_collision_cost(_traj, sdf[:min(batch_size, N)], robot, grid_length=grid_length, eps=collision_eps, weight=1.0),
-            "joints": compute_trajectory_joint_limits_cost(_traj, q_min, q_max, weight=1.0),
-            "vel":    compute_trajectory_velocity_cost(_traj, dt=dt, weight=1.0),
-            "smooth": compute_smoothness_cost(_traj, dt=dt, weight=1.0),
+            "coll":    compute_trajectory_collision_cost(_traj, sdf[:min(batch_size, N)], robot, grid_length=grid_length, eps=collision_eps, weight=1.0),
+            "joints":  compute_trajectory_joint_limits_cost(_traj, q_min, q_max, weight=1.0),
+            "smooth":  compute_smoothness_cost(_traj, dt=dt, weight=1.0),
+            "spacing": compute_waypoint_spacing_cost(_wp, weight=1.0),
+            "explore": compute_exploration_cost(_wp, q_start[:min(batch_size, N)], q_goal[:min(batch_size, N)], torch.tensor(1.0), threshold=explore_threshold, weight=1.0),
         }
-        _w = {"coll": w_coll, "joints": w_joints, "vel": w_velocity, "smooth": w_smooth}
+        _w = {"coll": w_coll, "joints": w_joints, "smooth": w_smooth, "spacing": w_spacing, "explore": w_explore}
     print(f"\n{'Loss':<10} {'Raw':>10}  {'Weight':>10}  {'Weighted':>10}")
     print("─" * 46)
     for name, val in _raw.items():
@@ -146,7 +153,7 @@ def train(
         else:
             idx = torch.randperm(N, device=device)[:batch_size]
         waypoints = model(q_start[idx], q_goal[idx], sdf[idx])
-        loss, l_coll, l_joint, l_vel, l_smooth = compute_losses(waypoints, sdf[idx])
+        loss, l_coll, l_joint, l_smooth, l_space, l_explore = compute_losses(waypoints, sdf[idx], q_start[idx], q_goal[idx])
 
         optimizer.zero_grad()
         loss.backward()
@@ -158,14 +165,15 @@ def train(
             model.eval()
             with torch.no_grad():
                 val_wp  = model(val_q_start, val_q_goal, val_sdf)
-                val_loss, *_ = compute_losses(val_wp, val_sdf)
+                val_loss, *_ = compute_losses(val_wp, val_sdf, val_q_start, val_q_goal)
             history["val"].append(val_loss.item())
             model.train()
 
         if (epoch + 1) % log_every == 0:
             msg = (f"Epoch {epoch+1:5d} | train={loss.item():.4f}  "
                    f"coll={l_coll.item():.4f}  joints={l_joint.item():.4f}  "
-                   f"vel={l_vel.item():.4f}  smooth={l_smooth.item():.4f}")
+                   f"smooth={l_smooth.item():.4f}  spacing={l_space.item():.4f}  "
+                   f"explore={l_explore.item():.4f}")
             if history["val"]:
                 msg += f"  val={history['val'][-1]:.4f}"
             tqdm.write(msg)

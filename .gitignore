@@ -36,3 +36,6 @@ src/data/
 *.tmp
 # hunkwise
 .vscode/hunkwise/
+
+# === Claude Code ===
+CLAUDE.md

@@ -115,7 +115,7 @@ def browse_trajectories(
         )
 
         # Build robot figure
-        viz = RobotViewer(q_traj_np, robot, obstacles=obstacles_viz)
+        viz = RobotViewer(q_traj_np, robot, obstacles=obstacles_viz, animate=animate)
         _orig_show = go.Figure.show
         go.Figure.show = lambda *a, **kw: None
         try:

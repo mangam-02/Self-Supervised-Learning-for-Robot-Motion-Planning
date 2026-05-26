@@ -343,7 +343,7 @@ def generate_dataset(
       metadata:    dict             Robot, grid, and joint-limit parameters
     """
     if clearance is None:
-        clearance = sphere_rad  # sphere surface must be outside obstacles
+        clearance = sphere_rad  # Sphere surface must be outside obstacles
 
     rng = np.random.default_rng(seed) # Random seed fixed
 
@@ -352,7 +352,7 @@ def generate_dataset(
     all_obs_x, all_obs_y, all_obs_r, all_n_obs = [], [], [], []
     n_attempted, n_no_pair = 0, 0
 
-    #Environments loop
+    # Environments loop
     for _ in tqdm(range(N_envs), desc="Generating dataset"):
         # Build an environment with obstacles
         n_obs     = int(rng.integers(n_obstacles_range[0], n_obstacles_range[1] + 1))

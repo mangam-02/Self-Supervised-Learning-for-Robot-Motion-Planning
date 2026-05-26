@@ -14,6 +14,7 @@ def forward_kinematics_torch(q, link_lengths):
     if not isinstance(link_lengths, torch.Tensor):
         link_lengths = torch.tensor(link_lengths, device=q.device, dtype=q.dtype)
     
+    # Calculate translations in x and y axis
     dx = torch.cos(q_cum) * link_lengths
     dy = torch.sin(q_cum) * link_lengths
 

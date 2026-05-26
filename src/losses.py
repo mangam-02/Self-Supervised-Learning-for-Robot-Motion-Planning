@@ -32,8 +32,8 @@ def compute_collision_cost(distances, eps=0.1, weight=1.0):
     distances: Tensor with the SDF distances.
     eps: Security radio.
     """
-    cost_inside  = -distances + 0.5 * eps
-    cost_danger  = 0.5 * (distances - eps) ** 2 / eps
+    cost_inside = -distances + 0.5 * eps
+    cost_danger = 0.5 * (distances - eps) ** 2 / eps
     cost = torch.where(distances < 0, cost_inside,
            torch.where(distances <= eps, cost_danger,
            torch.zeros_like(distances)))
@@ -78,11 +78,16 @@ def compute_exploration_cost(waypoints, q_start, q_goal, collision_cost,
     threshold:      minimum mean offset norm (radians) required while in collision
     waypoints:      [B, C, dof]
     """
-    C      = waypoints.shape[1]
+    # Obtain the baseline
+    C = waypoints.shape[1]
     t_vals = torch.linspace(0, 1, C, device=waypoints.device)
-    baseline   = q_start.unsqueeze(1) + t_vals.view(1, -1, 1) * (q_goal - q_start).unsqueeze(1)
-    offsets    = (waypoints - baseline)[:, 1:-1]          # [B, C-2, dof] — interior only
+    baseline = q_start.unsqueeze(1) + t_vals.view(1, -1, 1) * (q_goal - q_start).unsqueeze(1)
+    
+    # Compare the actual waypoints with the baseline
+    offsets = (waypoints - baseline)[:, 1:-1]          # [B, C-2, dof] — interior only
     offset_mag = offsets.norm(dim=-1).mean(dim=-1)        # [B]
+    
+    # Return the cost
     return weight * collision_cost * torch.clamp(threshold - offset_mag, min=0).mean()
 
 
@@ -94,8 +99,11 @@ def compute_waypoint_spacing_cost(waypoints, weight=1.0):
     outlier that raises the variance.
     waypoints: [B, C, dof]
     """
+    # Calculate the distance between waypoints
     diffs     = waypoints[:, 1:] - waypoints[:, :-1]   # [B, C-1, dof]
     distances = torch.norm(diffs, dim=-1)               # [B, C-1]
+    
+    # Compute the mean distance and penalize according to the variance
     mean_dist = distances.mean(dim=-1, keepdim=True)    # [B, 1]
     variance  = ((distances - mean_dist) ** 2).mean()
     return weight * variance
@@ -116,16 +124,16 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
     """
     B, T, dof = q_traj.shape
 
-    # --- Step 1: Forward kinematics → world-space sphere positions ---
+    # --- Step 1: Forward kinematics -> world-space sphere positions ---
     # The robot arm is approximated by a set of spheres placed along its links.
     # get_world_spheres_torch runs FK for every (batch, timestep) configuration
     # and returns the 2D center position of each sphere in world coordinates.
-    q_flat  = q_traj.reshape(B * T, dof)                     # flatten batch+time → [B*T, dof]
+    q_flat = q_traj.reshape(B * T, dof)                     # flatten batch+time → [B*T, dof]
     spheres = get_world_spheres_torch(q_flat, robot_info)     # [B*T, N_spheres, 2]
     N_spheres = spheres.shape[1]
 
     # Restore the time dimension so we can compute CCD travel distances later.
-    sphere_pos    = spheres.reshape(B, T, N_spheres, 2)       # [B, T, N_spheres, 2]
+    sphere_pos = spheres.reshape(B, T, N_spheres, 2)       # [B, T, N_spheres, 2]
 
     # --- Step 2: SDF lookup — distance from each sphere center to the nearest obstacle ---
     # query_sdf_differentiable does bilinear interpolation on the SDF grid,
@@ -133,28 +141,28 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
     # Positive distance = sphere is outside all obstacles.
     # Negative distance = sphere center is inside an obstacle.
     sphere_points = sphere_pos.reshape(B, T * N_spheres, 2)
-    distances     = query_sdf_differentiable(sdf_batch, sphere_points, grid_length)
-    distances     = distances.reshape(B, T, N_spheres)        # [B, T, N_spheres]
+    distances = query_sdf_differentiable(sdf_batch, sphere_points, grid_length)
+    distances = distances.reshape(B, T, N_spheres)        # [B, T, N_spheres]
 
     # --- Step 3: CCD — inflate the danger zone for fast-moving spheres ---
     # A sphere moving quickly can jump over a thin obstacle between two timesteps
     # (tunneling). To prevent this, we expand eps by half the sphere's travel
     # distance: a sphere that moves 0.1m in one step gets an extra 0.05m margin.
     if ccd:
-        travel  = torch.norm(sphere_pos[:, 1:] - sphere_pos[:, :-1], dim=-1)  # [B, T-1, N_spheres]
-        travel  = torch.cat([travel, travel[:, -1:]], dim=1)  # repeat last step → [B, T, N_spheres]
+        travel = torch.norm(sphere_pos[:, 1:] - sphere_pos[:, :-1], dim=-1)  # [B, T-1, N_spheres]
+        travel = torch.cat([travel, travel[:, -1:]], dim=1)  # repeat last step → [B, T, N_spheres]
         eff_eps = eps + travel / 2                            # effective danger zone per sphere
     else:
         eff_eps = eps
 
     # --- Step 4: Per-sphere cost — three zones ---
-    # Zone 1 (d < 0):          sphere is INSIDE obstacle → linear cost, grows with penetration depth
-    # Zone 2 (0 ≤ d ≤ eff_eps): sphere is in DANGER ZONE → quadratic cost, zero at d=eff_eps
-    # Zone 3 (d > eff_eps):    sphere is SAFE → zero structured cost
-    # Repulsion (all zones):   exponential term that is always > 0, decaying with distance.
-    #   This provides gradient everywhere in the workspace, so the arm is always
-    #   gently pushed away from obstacles — even before entering the danger zone.
-    #   Larger eps → repulsion reaches farther → arm routes around instead of squeezing through.
+    # Zone 1 (d < 0): sphere is INSIDE obstacle -> linear cost, grows with penetration depth
+    # Zone 2 (0 <= d <= eff_eps): sphere is in DANGER ZONE -> quadratic cost, zero at d=eff_eps
+    # Zone 3 (d > eff_eps): sphere is SAFE -> zero structured cost
+    # Repulsion (all zones): exponential term that is always > 0, decaying with distance.
+    # This provides gradient everywhere in the workspace, so the arm is always
+    # gently pushed away from obstacles — even before entering the danger zone.
+    # Larger eps -> repulsion reaches farther -> arm routes around instead of squeezing through.
     cost_inside = -distances + 0.5 * eff_eps
     cost_danger = 0.5 * (distances - eff_eps) ** 2 / eff_eps
     repulsion   = (eps * 0.5) * torch.exp(-distances.clamp(min=0) / eps)
@@ -164,10 +172,10 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
 
     # --- Step 5: Joint-position weighting ---
     # Base spheres cost more than tip spheres. This creates an incentive to shift
-    # any collision from the forearm towards the fingers: to do so, the arm must
+    # any collision from the forearm towards the EE: to do so, the arm must
     # bend — and that bending motion is geometrically equivalent to routing around
-    # the obstacle. Tip collision (cheap) → arm bends further → no collision (free).
-    # relative_pos = 0 at base, 1 at tip → weight = 1 at base, (1-decay) at tip.
+    # the obstacle. Tip collision (cheap) -> arm bends further -> no collision (free).
+    # relative_pos = 0 at base, 1 at tip -> weight = 1 at base, (1-decay) at tip.
     if joint_weight_decay > 0:
         link_lengths = robot_info.linklengths
         total_length = sum(link_lengths)
@@ -185,26 +193,28 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
 
     return per_sphere  # [B, T, N_spheres]
 
-
 def compute_trajectory_collision_cost(q_traj, sdf_batch, robot_info,
                                       grid_length=2.5, eps=0.1, weight=1.0,
                                       ccd=True, joint_weight_decay=0.5,
                                       return_per_step=False):
-    """Sum-based collision cost: penalizes total collision across the trajectory."""
+    """
+    Sum-based collision cost: penalizes total collision across the trajectory.
+    """
     per_sphere = _compute_sphere_costs(q_traj, sdf_batch, robot_info, grid_length, eps, ccd, joint_weight_decay)
     _, T, _    = per_sphere.shape
-    per_step   = per_sphere.amax(dim=-1)          # [B, T]
+    per_step   = per_sphere.amax(dim=-1) # [B, T]
     total      = weight * per_step.sum() / T
     if return_per_step:
         return total, per_step
     return total
 
-
 def compute_trajectory_max_collision_cost(q_traj, sdf_batch, robot_info,
                                           grid_length=2.5, eps=0.1, weight=1.0,
                                           ccd=True, joint_weight_decay=0.5,
                                           return_per_step=False):
-    """Max-based collision cost: penalizes the single worst collision across the trajectory."""
+    """
+    Max-based collision cost: penalizes the single worst collision across the trajectory.
+    """
     per_sphere = _compute_sphere_costs(q_traj, sdf_batch, robot_info, grid_length, eps, ccd, joint_weight_decay)
     per_step   = per_sphere.amax(dim=-1)          # [B, T]
     total      = weight * per_step.amax(dim=-1).mean()

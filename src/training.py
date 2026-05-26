@@ -19,6 +19,9 @@ from losses import (
 
 
 def _load(dataset: dict | str) -> dict:
+    """
+    Load the dataset to use
+    """
     if isinstance(dataset, str):
         return torch.load(dataset, weights_only=False)
     return dataset
@@ -64,33 +67,30 @@ def train(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ── Load data ─────────────────────────────────────────────────────────────
+    # Load data
     train_ds = _load(train_dataset)
     val_ds   = _load(val_dataset) if val_dataset is not None else None
-
     meta        = train_ds["metadata"]
     grid_length = meta["grid_length"]
     robot       = RobotInfo.from_linklengths(meta["linklengths"], sphere_rad=meta["sphere_rad"])
     q_min       = torch.tensor(meta["q_min"], dtype=torch.float32, device=device)
     q_max       = torch.tensor(meta["q_max"], dtype=torch.float32, device=device)
-    # Joint 0 is continuous but we bound it to [-2π, 2π] for planning purposes
     q_min[0]    = -2 * torch.pi
     q_max[0]    =  2 * torch.pi
     dof         = meta["dof"]
-
     sdf     = train_ds["sdf"].to(device)
     q_start = train_ds["q_start"].to(device)
     q_goal  = train_ds["q_goal"].to(device)
     N       = sdf.shape[0]
-
     if val_ds is not None:
         val_sdf     = val_ds["sdf"].to(device)
         val_q_start = val_ds["q_start"].to(device)
         val_q_goal  = val_ds["q_goal"].to(device)
 
-    # ── Model & optimizer ────────────────────────────────────────────────────
+    # Model
     model = WarmStartPlanner(dof=dof, T=T, C=C, linklengths=meta["linklengths"]).to(device)
 
+    # Load autoencoders
     if env_encoder_path is not None:
         model.env_encoder.load_state_dict(
             torch.load(env_encoder_path, map_location=device, weights_only=True)
@@ -109,12 +109,17 @@ def train(
             for p in model.state_encoder.parameters():
                 p.requires_grad_(False)
 
+    # Optimizer
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=lr
     )
 
+    # Decreasing learning rate
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9995)
+
+    # Compute losses
     def compute_losses(waypoints, sdf_batch, q_s, q_g):
-        traj      = model.trajectory(waypoints)     # [B, T, dof] — full B-spline
+        traj      = model.trajectory(waypoints) # [B, T, dof] — full B-spline
         l_coll    = compute_trajectory_max_collision_cost(traj, sdf_batch, robot, grid_length=grid_length, eps=collision_eps, weight=w_coll)
         l_joint   = compute_trajectory_joint_limits_cost(traj, q_min, q_max, weight=w_joints)
         l_smooth  = compute_smoothness_cost(traj, dt=dt, weight=w_smooth)
@@ -123,7 +128,7 @@ def train(
                                              threshold=explore_threshold, weight=w_explore)
         return l_coll + l_joint + l_smooth + l_space + l_explore, l_coll, l_joint, l_smooth, l_space, l_explore
 
-    # ── Loss scale diagnostics ────────────────────────────────────────────────
+    # Loss scale diagnostics
     model.eval()
     with torch.no_grad():
         _wp   = model(q_start[:min(batch_size, N)], q_goal[:min(batch_size, N)], sdf[:min(batch_size, N)])
@@ -143,14 +148,14 @@ def train(
         print(f"{name:<10} {val.item():>10.4f}  {_w[name]:>10.4f}  {weighted:>10.4f}")
     print()
 
-    # ── Training loop ────────────────────────────────────────────────────────
+    # Training and validation loop
     history = {"train": [], "val": []}
 
     for epoch in tqdm(range(n_epochs), desc="Training"):
         model.train()
 
         if N <= batch_size:
-            # Small dataset: use all samples every epoch (no noise from sampling)
+            # Small dataset: use all samples every epoch
             idx = torch.arange(N, device=device)
         else:
             idx = torch.randperm(N, device=device)[:batch_size]
@@ -163,6 +168,8 @@ def train(
 
         history["train"].append(loss.item())
 
+        scheduler.step()
+
         if val_ds is not None and (epoch + 1) % log_every == 0:
             model.eval()
             with torch.no_grad():
@@ -172,15 +179,16 @@ def train(
             model.train()
 
         if (epoch + 1) % log_every == 0:
-            msg = (f"Epoch {epoch+1:5d} | train={loss.item():.4f}  "
+            current_lr = optimizer.param_groups[0]['lr']
+            msg = (f"Epoch {epoch+1:5d} | lr={current_lr:.2e} | train={loss.item():.4f}  "
                    f"coll={l_coll.item():.4f}  joints={l_joint.item():.4f}  "
                    f"smooth={l_smooth.item():.4f}  spacing={l_space.item():.4f}  "
                    f"explore={l_explore.item():.4f}")
-            if history["val"]:
+            if val_ds is not None and len(history["val"]) > 0:
                 msg += f"  val={history['val'][-1]:.4f}"
             tqdm.write(msg)
 
-    # ── Loss plot ────────────────────────────────────────────────────────────
+    # Loss plot
     fig, ax = plt.subplots(figsize=(9, 3))
     ax.plot(history["train"], label="train", linewidth=0.8)
     if history["val"]:
@@ -195,7 +203,7 @@ def train(
     plt.tight_layout()
     plt.show()
 
-    # ── Save ─────────────────────────────────────────────────────────────────
+    # Save
     if save_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         torch.save(model.state_dict(), save_path)
@@ -213,6 +221,7 @@ def train(
 
 
 def train_state_autoencoder(
+    file_name: str,
     linklengths: list[float],
     dof: int = 3,
     latent_dim: int = 64,
@@ -254,6 +263,7 @@ def train_state_autoencoder(
 
     history = {"train": [], "val": []}
 
+    # Training loop
     for epoch in tqdm(range(epochs), desc="Training State Autoencoder"):
         model.train()
         idx = train_idx[torch.randint(0, len(train_idx), (batch_size,))]
@@ -266,6 +276,7 @@ def train_state_autoencoder(
         if epoch % log_every == 0:
             history["val"].append(_eval(val_idx))
 
+    # Loss plot
     fig, ax = plt.subplots(figsize=(9, 3))
     ax.plot(history["train"], label="train", linewidth=0.8)
     if history["val"]:
@@ -281,18 +292,20 @@ def train_state_autoencoder(
 
     print(f"Test loss: {_eval(test_idx):.6f}")
 
+    # Save
     if save_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         torch.save(model.state_dict(), save_path)
-        enc_path = os.path.join(os.path.dirname(save_path), "state_encoder.pt")
+        enc_path = os.path.join(os.path.dirname(save_path), file_name)
         torch.save(model.encoder.state_dict(), enc_path)
-        print(f"Saved: {save_path}  (encoder → {enc_path})")
+        print(f"Saved: {save_path}  (encoder -> {enc_path})")
 
     return model, history
 
 
 def train_env_autoencoder(
     dataset_path: str,
+    file_name: str,
     latent_dim: int = 64,
     batch_size: int = 64,
     epochs: int = 5000,
@@ -332,6 +345,7 @@ def train_env_autoencoder(
 
     history = {"train": [], "val": []}
 
+    # Training loop
     for epoch in tqdm(range(epochs), desc="Training Env Autoencoder"):
         model.train()
         idx = train_idx[torch.randint(0, len(train_idx), (batch_size,))]
@@ -345,6 +359,7 @@ def train_env_autoencoder(
         if epoch % log_every == 0:
             history["val"].append(_eval(val_idx))
 
+    # Loss plot
     fig, ax = plt.subplots(figsize=(9, 3))
     ax.plot(history["train"], label="train", linewidth=0.8)
     if history["val"]:
@@ -360,12 +375,13 @@ def train_env_autoencoder(
 
     print(f"Test loss: {_eval(test_idx):.6f}")
 
+    # Save
     if save_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         torch.save(model.state_dict(), save_path)
-        enc_path = os.path.join(os.path.dirname(save_path), "env_encoder.pt")
+        enc_path = os.path.join(os.path.dirname(save_path), file_name)
         torch.save(model.encoder.state_dict(), enc_path)
-        print(f"Saved: {save_path}  (encoder → {enc_path})")
+        print(f"Saved: {save_path}  (encoder -> {enc_path})")
 
     return model, history
 

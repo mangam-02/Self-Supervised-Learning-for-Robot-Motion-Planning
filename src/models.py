@@ -100,11 +100,11 @@ class EnvEncoder(nn.Module):
         # Reduce the SDF map (128x128) into a small
         # latent vector (64)
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 4, 2, 1),   # 128 → 64
+            nn.Conv2d(1, 16, 4, 2, 1),   # 128 -> 64
             nn.ReLU(),
-            nn.Conv2d(16, 32, 4, 2, 1),  # 64 → 32
+            nn.Conv2d(16, 32, 4, 2, 1),  # 64 -> 32
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1),  # 32 → 16
+            nn.Conv2d(32, 64, 4, 2, 1),  # 32 -> 16
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
         )
@@ -125,11 +125,11 @@ class EnvDecoder(nn.Module):
         # SDF map (128x128)
         self.fc = nn.Linear(latent, 64 * 16 * 16)
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 16 → 32
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 16 -> 32
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 16, 4, 2, 1),  # 32 → 64
+            nn.ConvTranspose2d(32, 16, 4, 2, 1),  # 32 -> 64
             nn.ReLU(),
-            nn.ConvTranspose2d(16, 1, 4, 2, 1),   # 64 → 128
+            nn.ConvTranspose2d(16, 1, 4, 2, 1),   # 64 -> 128
         )
 
     def forward(self, z):
@@ -183,7 +183,7 @@ class WaypointDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(256, (C - 2) * dof),
         )
-        # Zero-init output layer so initial offsets are 0 → trajectory starts as straight line
+        # Zero-init output layer so initial offsets are 0 -> trajectory starts as straight line
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 

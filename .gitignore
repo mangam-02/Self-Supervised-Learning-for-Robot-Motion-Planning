@@ -39,3 +39,7 @@ src/data/
 
 # === Claude Code ===
 CLAUDE.md
+"data/" 
+"models/" 
+"__pycache__/" 
+".ipynb_checkpoints/" 

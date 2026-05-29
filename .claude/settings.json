@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/timomatuszewski/Desktop/SS26/Advanced_Deep_Learning_for_Robotics/Self-Supervised-Learning-for-Robot-Motion-Planning remote get-url origin)",
+      "Bash(grep -E \"\\\\.\\(gif|png\\)$\")"
+    ]
+  }
+}

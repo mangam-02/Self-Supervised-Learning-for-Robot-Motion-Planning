@@ -1,20 +1,20 @@
 # === Python ===
-pycache/
+__pycache__/
 *.py[cod]
 *.so
 *.egg-info/
 dist/
 build/
 
-# Virtual environments
+# === Virtual environments ===
 .venv/
 venv/
 env/
 
-# Jupyter
+# === Jupyter ===
 .ipynb_checkpoints/
 
-# Logs
+# === Logs ===
 *.log
 
 # === macOS ===
@@ -24,22 +24,9 @@ env/
 .vscode/
 .idea/
 
-# === Git Submodules ===
-# (Wichtig: NICHT den Ordner ignorieren!)
-# external/SimpleArm/  <-- NICHT ignorieren
-
-# === Data ===
+# === Datasets (large binary files) ===
 src/data/
 
 # === Misc ===
 *.swp
 *.tmp
-# hunkwise
-.vscode/hunkwise/
-
-# === Claude Code ===
-CLAUDE.md
-"data/" 
-"models/" 
-"__pycache__/" 
-".ipynb_checkpoints/" 

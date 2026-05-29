@@ -1,11 +1,11 @@
 # Warm-Starting Trajectory Optimization with Self-Supervised Learning
 
-> **Self-supervised neural warm-start for robot motion planning** — a learned initializer that predicts near-feasible trajectories for a 3-DOF planar arm, enabling faster and more reliable gradient-based optimization.
+> **Neural warm-starts for robot motion planning. No labeled trajectories needed.**
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c?logo=pytorch&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Course](https://img.shields.io/badge/TUM-Advanced%20Deep%20Learning%20for%20Robotics-0065BD?logo=academia&logoColor=white)
+![Status](https://img.shields.io/badge/Status-In%20Development-yellow)
+![Course](https://img.shields.io/badge/TUM-Advanced%20Deep%20Learning%20for%20Robotics-0065BD)
 
 ---
 
@@ -13,7 +13,7 @@
 
 <table>
   <tr>
-    <td align="center"><b>Trained warm-start trajectory</b></td>
+    <td align="center"><b>Trained warm-start — validation sample</b></td>
     <td align="center"><b>Baseline (zero output / straight line)</b></td>
   </tr>
   <tr>
@@ -25,7 +25,7 @@
 <table>
   <tr>
     <td align="center"><b>Multi-obstacle environment</b></td>
-    <td align="center"><b>Tunneling failure (before fix)</b></td>
+    <td align="center"><b>Tunneling failure (before CCD fix)</b></td>
   </tr>
   <tr>
     <td><img src="src/resources/overfit_64_10_2obs_working_trajectory_16.gif" width="360"/></td>
@@ -37,44 +37,97 @@
 
 ## Overview
 
-Trajectory optimization is the backbone of motion planning for robotic arms: given a start and goal configuration, find a smooth, collision-free path. In practice, gradient-based optimizers are sensitive to initialization — a poor warm-start may converge to a local minimum that passes through obstacles, or require many iterations to escape.
+Trajectory optimization is a fundamental tool in robot motion planning: given start and goal joint configurations, find a smooth, collision-free path through the workspace. Gradient-based optimizers (CHOMP, TrajOpt, GPMP2) are reliable and expressive, but they are **highly sensitive to initialization**. A straight-line warm-start almost always intersects obstacles, forcing the optimizer to spend many iterations escaping infeasible regions or converging to a local minimum that still collides.
 
-This project addresses the warm-starting problem with a **self-supervised neural network** that predicts a near-feasible trajectory directly from the task description (start/goal joint angles) and a signed distance field (SDF) of the environment. The key insight is that the network does not require any labeled trajectory dataset: it is trained end-to-end against the same differentiable cost functions used by the optimizer itself.
+**The core tradeoff:**
 
-**The result**: a planner that generalizes across obstacle layouts and task configurations, routing around obstacles without a single expert demonstration.
+| Approach | Speed | Reliability | Requires |
+|---|---|---|---|
+| Classical optimization (cold start) | Slow | High | Good initialization |
+| Pure learning-based | Fast | Low at distribution shift | Large labeled dataset |
+| **This project** | **Fast** | **High** | **No labeled data** |
+
+This project trains a **self-supervised warm-start predictor**: a neural network that maps (start config, goal config, obstacle SDF) directly to a near-feasible joint-space trajectory, optimized entirely against differentiable planning costs. No expert demonstrations, no labeled trajectory datasets.
+
+At inference, the predicted B-spline trajectory places the optimizer at a configuration already near-feasible, with lower collision cost from the first gradient step.
+
+---
+
+## Project Status
+
+The **neural predictor** (warm-start generation) is fully implemented and trained. The downstream **gradient-based refinement** stage is the planned next step.
+
+| Component | Status |
+|---|---|
+| Procedural dataset generation (SDF environments, non-trivial pair sampling) | ✅ Done |
+| Environment autoencoder pre-training | ✅ Done |
+| State autoencoder pre-training | ✅ Done |
+| Self-supervised end-to-end training (`WarmStartPlanner`) | ✅ Done |
+| Differentiable cost functions (collision, limits, smoothness, spacing, exploration) | ✅ Done |
+| Trajectory visualization and GIF export | ✅ Done |
+| Gradient-based refinement stage (warm-start → optimizer → collision-free trajectory) | 🚧 Planned |
+| Quantitative evaluation (success rate, planning time vs. cold-start baseline) | 🚧 Planned |
 
 ---
 
 ## Method
 
-### Pipeline
+### Conceptual Pipeline
 
 ```
-  q_start, q_goal          SDF map (128×128)
-       │                          │
-       ▼                          ▼
- StateEncoder (MLP)        EnvEncoder (CNN)
-   64-dim latent             64-dim latent
-       │                          │
-       └──────────┬───────────────┘
-                  ▼
-          WaypointDecoder (MLP)
-        C−2 interior waypoints
-                  │
-      (prepend q_start, append q_goal)
-                  ▼
-      B-Spline Interpolation (T=50 steps)
-                  │
-     Differentiable Cost Functions
-      (collision · limits · smoothness)
-                  │
-                  ▼
-           Loss → Backprop
+  Start/Goal Config + Obstacle Environment (SDF)
+                       |
+                       v
+          +------------------------+
+          |  Neural Warm-Start     |  <- implemented
+          |  Predictor             |
+          +------------------------+
+                       |
+                       v
+          Near-feasible trajectory
+          (cubic B-spline, T=50 steps)
+                       |
+                       v
+          +------------------------+
+          |  Gradient-based        |  <- planned
+          |  Refinement            |
+          +------------------------+
+                       |
+                       v
+          Collision-free trajectory
+```
+
+### Neural Architecture
+
+```
+  q_start, q_goal              SDF map (128x128)
+        |                             |
+        v                             v
+  StateEncoder (MLP)          EnvEncoder (CNN)
+  [q, FK(q)] -> 64-d          3-layer conv -> 64-d
+        |                             |
+        +-------------+---------------+
+                      |
+                      v
+              WaypointDecoder (MLP)
+            predicts C-2 interior waypoints
+                      |
+          prepend q_start · append q_goal
+                      |
+                      v
+        B-Spline Interpolation  (T=50 steps)
+                      |
+        Differentiable Cost Functions
+         collision · limits · smoothness
+         spacing · exploration
+                      |
+                      v
+               Loss -> Backprop
 ```
 
 ### Trajectory Representation
 
-Trajectories are parameterized as **cubic B-splines**: the network predicts `C = 10` control points in joint space (the 8 interior waypoints, with start/goal fixed), and the full `T = 50`-step trajectory is evaluated via the Cox–de Boor recursion. This continuous representation provides smooth gradients through the entire trajectory and prevents the optimizer from creating jerky, discontinuous paths.
+Trajectories are parameterized as **cubic B-splines**: the network predicts `C = 10` control points in joint space (8 interior waypoints; start and goal are fixed), and the full `T = 50`-step trajectory is evaluated via the Cox-de Boor recursion. This continuous representation provides smooth gradients and prevents discontinuous paths.
 
 ### Self-Supervised Training
 
@@ -82,54 +135,50 @@ No reference trajectories are used. The model is trained by minimizing a composi
 
 | Cost term | Description |
 |---|---|
-| **Collision** | Three-zone penalty (inside / danger zone / safe) + exponential repulsion; CCD inflation prevents tunneling |
+| **Collision** | Three-zone penalty (inside / danger zone / safe) plus exponential repulsion; CCD inflation prevents tunneling through thin obstacles |
 | **Joint limits** | Quadratic penalty for joint angle violations |
 | **Smoothness** | Penalizes squared joint velocities and accelerations |
-| **Waypoint spacing** | Penalizes unequal spacing between consecutive control points (discourages rushing through obstacles) |
+| **Waypoint spacing** | Penalizes unequal spacing between consecutive control points to discourage rushing through obstacles |
 | **Exploration** | Anti-local-minimum term that encourages larger deviations from the straight line when the path is in collision |
 
-The robot body is approximated by a set of **spheres** placed along each link. Forward kinematics is implemented in PyTorch so that gradients flow from sphere world positions back through joint angles into the network weights. Sphere-to-obstacle distances are computed via **bilinear interpolation** on the SDF grid — fully differentiable.
-
-### Environment Encoding
-
-Environments consist of randomly sampled circular obstacles placed within the robot's reachable workspace. Each environment is rasterized into a **128×128 signed distance field** (grid extent 2.5 m). The CNN encoder compresses this map into a 64-dimensional latent vector. Optionally, the environment encoder and a state autoencoder can be **pre-trained independently** before end-to-end training of the full planner.
+The robot body is approximated by a set of **spheres** placed along each link. Forward kinematics is implemented in PyTorch so gradients flow from sphere world positions back through joint angles into the network weights. Sphere-to-obstacle distances are computed via **bilinear interpolation** on the SDF grid, making the entire pipeline end-to-end differentiable.
 
 ---
 
 ## Technical Features
 
-- **B-spline trajectory parameterization** with cubic Cox–de Boor basis and clamped endpoints
-- **CNN environment encoder** compressing 128×128 SDF maps to 64-d latent vectors
+- **B-spline trajectory parameterization** with cubic Cox-de Boor basis and clamped endpoints (C=10, T=50)
+- **CNN environment encoder** compressing 128x128 SDF maps to a 64-d latent vector
 - **MLP state encoder** encoding `[q_start, q_goal, FK_start, FK_goal]` to 64-d
-- **Zero-initialized decoder** — warm-start at epoch 0 is a straight-line interpolation (stable baseline)
-- **Differentiable sphere-based collision model** with CCD and joint-position weighting
+- **Zero-initialized decoder output layer** so that epoch-0 predictions are straight-line interpolations
+- **Differentiable sphere-based collision model** with bilinear SDF sampling
+- **Continuous collision detection (CCD)** via danger-zone inflation by half travel distance
 - **Exploration cost** that breaks the "barely-outside-obstacle" local minimum
 - **Pre-training support** for environment and state autoencoders
-- **Procedural dataset generation** with non-trivial pair filtering (straight path blocked)
-- **Interactive Jupyter browsers** for datasets and predicted trajectories
+- **Procedural dataset generation** with non-trivial pair filtering (straight-line path blocked)
+- **Interactive Jupyter browsers** for navigating datasets and predicted trajectories
 - **GIF export** of trajectory animations via Plotly + Kaleido + Pillow
-- **Adam + ExponentialLR** training schedule
 
 ---
 
 ## Results
 
-The model is trained self-supervised on procedurally generated environments with 1–4 circular obstacles. Training converges reliably; validation loss tracks training loss closely, indicating good generalization.
+Trained self-supervised on procedurally generated 2D environments with 1-4 circular obstacles. Validation loss tracks training loss closely, indicating good generalization across unseen obstacle configurations.
 
 **Qualitative results** (from `src/resources/`):
 
 | Asset | Description |
 |---|---|
 | `val_trajectories_working_trajectory_7.gif` | Predicted trajectory on a held-out validation sample |
-| `overfit_64_10_2obs_working_trajectory_16.gif` | Two-obstacle environment — arm routes around both obstacles |
-| `tunnel_trajectory.gif_trajectory_0.gif` | Early training failure — arm tunnels through an obstacle (problem subsequently fixed with CCD and exploration cost) |
-| `zero_output_trajectory_0.gif` | Baseline (network output = 0, i.e., straight-line interpolation) — collides |
+| `overfit_64_10_2obs_working_trajectory_16.gif` | Two-obstacle environment, arm routes around both |
+| `tunnel_trajectory.gif_trajectory_0.gif` | Early training failure: arm tunnels through an obstacle (fixed with CCD and exploration cost) |
+| `zero_output_trajectory_0.gif` | Baseline with output = 0 (straight-line interpolation), collides with obstacles |
 | `val_trajectories_working_cost_7.png` | Per-timestep collision and joint-limit costs after training |
-| `zero_output_cost_0.png` | Per-timestep costs for the straight-line baseline |
+| `zero_output_cost_0.png` | Same cost profile for the straight-line baseline |
 
 <table>
   <tr>
-    <td align="center"><b>Trained — cost profile</b></td>
+    <td align="center"><b>Trained model — cost profile</b></td>
     <td align="center"><b>Baseline — cost profile</b></td>
   </tr>
   <tr>
@@ -144,31 +193,29 @@ The model is trained self-supervised on procedurally generated environments with
 
 ```
 Self-Supervised-Learning-for-Robot-Motion-Planning/
-│
-├── src/
-│   ├── models.py                    # WarmStartPlanner, EnvEncoder, StateEncoder,
-│   │                                #   WaypointDecoder, autoencoders, B-spline utilities
-│   ├── losses.py                    # Differentiable cost functions (collision, smoothness,
-│   │                                #   joint limits, spacing, exploration)
-│   ├── training.py                  # train(), train_env_autoencoder(), train_state_autoencoder()
-│   ├── data.py                      # SDF generation, dataset assembly, dataset browser
-│   ├── utils.py                     # Forward kinematics, sphere FK, differentiable SDF query
-│   ├── visualization.py             # browse_trajectories(), save_viewer_as_gif()
-│   │
-│   ├── train.ipynb                  # End-to-end training pipeline
-│   ├── test.ipynb                   # Evaluation, visualization, trajectory browser
-│   ├── create_training_data.ipynb   # Procedural dataset generation
-│   ├── process_nvidia_1_sample.ipynb # Single-sample overfitting experiment
-│   │
-│   ├── models/                      # Saved model weights (.pt)
-│   ├── data/                        # Generated datasets (.pt)
-│   └── resources/                   # Output GIFs and cost plots
-│
-├── external/
-│   └── SimpleArm/                   # Git submodule — 2D planar arm simulator
-│
-├── requirements.txt
-└── README.md
+|
++-- src/
+|   +-- models.py                    # WarmStartPlanner, encoders, B-spline utilities
+|   +-- losses.py                    # Differentiable cost functions
+|   +-- training.py                  # Training loops for planner and autoencoders
+|   +-- data.py                      # Dataset generation, SDF building, dataset browser
+|   +-- utils.py                     # Forward kinematics, sphere FK, differentiable SDF query
+|   +-- visualization.py             # Trajectory browser, GIF export
+|   |
+|   +-- train.ipynb                  # End-to-end training pipeline
+|   +-- test.ipynb                   # Evaluation and trajectory visualization
+|   +-- create_training_data.ipynb   # Procedural dataset generation
+|   +-- process_nvidia_1_sample.ipynb # Single-sample overfitting experiment (GPU)
+|   |
+|   +-- models/                      # Saved model weights (.pt)
+|   +-- data/                        # Generated datasets (.pt) -- gitignored
+|   +-- resources/                   # Output GIFs and cost plots
+|
++-- external/
+|   +-- SimpleArm/                   # Git submodule: 2D planar arm simulator
+|
++-- requirements.txt
++-- README.md
 ```
 
 ---
@@ -183,7 +230,7 @@ Self-Supervised-Learning-for-Robot-Motion-Planning/
 ### Setup
 
 ```bash
-# 1. Clone with submodule
+# 1. Clone repository with submodule
 git clone --recurse-submodules https://github.com/mangam-02/Self-Supervised-Learning-for-Robot-Motion-Planning.git
 cd Self-Supervised-Learning-for-Robot-Motion-Planning
 
@@ -199,7 +246,7 @@ source .venv/bin/activate          # macOS / Linux
 pip install -r requirements.txt
 ```
 
-If you cloned without `--recurse-submodules`, initialize the `SimpleArm` submodule manually:
+If you cloned without `--recurse-submodules`:
 
 ```bash
 git submodule update --init --recursive
@@ -217,7 +264,7 @@ brew install python@3.11
 sudo apt update && sudo apt install python3.11 python3.11-venv python3.11-dev
 ```
 
-**Windows** — download the installer from [python.org](https://www.python.org/downloads/release/python-3110/) and check *Add Python to PATH*.
+**Windows:** download from [python.org](https://www.python.org/downloads/release/python-3110/) and check *Add Python to PATH*.
 
 ### Deactivating
 
@@ -237,7 +284,7 @@ deactivate
 
 ## Usage
 
-All entry points are Jupyter notebooks under `src/`. Activate your virtual environment first, then launch Jupyter:
+All entry points are Jupyter notebooks under `src/`. Activate your environment first:
 
 ```bash
 source .venv/bin/activate
@@ -246,11 +293,7 @@ jupyter notebook src/
 
 ### 1 — Generate a dataset
 
-Open `src/create_training_data.ipynb`. It calls `data.generate_dataset()`, which:
-- Samples random circular obstacle environments
-- Builds 128×128 SDF tensors
-- Samples non-trivial `(q_start, q_goal)` pairs (straight-line path blocked)
-- Saves train / val / test splits to `src/data/`
+`src/create_training_data.ipynb` calls `data.generate_dataset()`:
 
 ```python
 from data import generate_dataset
@@ -263,7 +306,7 @@ dataset = generate_dataset(
 
 ### 2 — Train the planner
 
-Open `src/train.ipynb`. The notebook trains the `WarmStartPlanner` end-to-end:
+`src/train.ipynb` trains the `WarmStartPlanner` end-to-end:
 
 ```python
 from training import train
@@ -276,18 +319,17 @@ model, history = train(
 )
 ```
 
-Optional: pre-train the environment and state autoencoders before end-to-end training:
+Optional: pre-train encoders separately before end-to-end training:
 
 ```python
 from training import train_env_autoencoder, train_state_autoencoder
-
 train_env_autoencoder("data/sdf_dataset.pt", ...)
 train_state_autoencoder(linklengths=[0.4, 0.3, 0.2], ...)
 ```
 
 ### 3 — Evaluate and visualize
 
-Open `src/test.ipynb`. It loads a trained model and launches an interactive browser:
+`src/test.ipynb` launches an interactive trajectory browser:
 
 ```python
 from visualization import browse_trajectories
@@ -299,7 +341,7 @@ browse_trajectories(
 )
 ```
 
-Use **Next ►** / **◄ Prev** buttons to navigate samples. Click **💾 Save** to export the current trajectory as a GIF and the cost profile as a PNG to `src/resources/`.
+Navigate with **Next / Prev** buttons. Click **Save** to export a GIF and cost plot to `src/resources/`.
 
 ---
 
@@ -308,24 +350,24 @@ Use **Next ►** / **◄ Prev** buttons to navigate samples. Click **💾 Save**
 | Component | Choice | Rationale |
 |---|---|---|
 | Trajectory parametrization | Cubic B-spline (C=10, T=50) | Smooth gradients, fewer parameters than raw waypoints |
-| Collision model | Sphere decomposition + SDF bilinear interpolation | Differentiable, GPU-compatible |
+| Collision model | Sphere decomposition + bilinear SDF sampling | Differentiable and GPU-compatible |
 | CCD | Danger-zone inflation by half travel distance | Prevents tunneling through thin obstacles |
-| Encoder depth | 3-layer CNN (16→32→64) + AdaptiveAvgPool | Compact, fast; SDF is smooth |
-| State features | `[q, fk(q)]` for start and goal | Exposes Cartesian geometry to the MLP |
-| Decoder init | Zero weights on output layer | Training starts from straight-line baseline |
-| Optimizer | Adam, lr=1e-3, ExponentialLR γ=0.9995 | Smooth decay avoids late-stage oscillations |
+| Encoder | 3-layer CNN (16 to 32 to 64 channels) + AdaptiveAvgPool | Compact; SDF maps are spatially smooth |
+| State features | `[q, FK(q)]` for start and goal | Exposes Cartesian geometry to the MLP |
+| Decoder init | Zero weights on output layer | Epoch-0 output is a straight-line baseline |
+| Optimizer | Adam, lr=1e-3, ExponentialLR gamma=0.9995 | Smooth decay without late-stage oscillations |
 | Framework | PyTorch 2.x | Autograd through FK, SDF sampling, and B-spline evaluation |
 
 ---
 
 ## Future Work
 
-- **Higher-DOF robots** — extend to 6- or 7-DOF serial chains and SE(3) task spaces
-- **3D environments** — replace 2D SDF grids with voxel grids or neural implicit representations
-- **Dynamic obstacles** — condition the encoder on time-varying obstacle states
-- **Optimization refinement stage** — chain the network with a gradient-based optimizer (e.g., GPMP2, TrajOpt) initialized at the predicted warm-start
-- **Sim-to-real transfer** — deploy on physical hardware using learned domain adaptation
-- **Learned cost weights** — meta-learn the loss weighting for faster adaptation to new environments
+- **Gradient-based refinement**: chain the predicted warm-start with a trajectory optimizer (TrajOpt, CHOMP, GPMP2) and measure convergence speed vs. cold-start baseline
+- **Quantitative evaluation**: success rate, planning time, and cost comparison on a held-out test set
+- **Higher-DOF robots**: extend to 6/7-DOF serial chains and SE(3) task spaces
+- **3D environments**: replace 2D SDF grids with voxel grids or neural implicit representations
+- **Dynamic obstacles**: condition the encoder on time-varying obstacle states
+- **Sim-to-real transfer**: deploy on physical hardware with domain adaptation
 
 ---
 

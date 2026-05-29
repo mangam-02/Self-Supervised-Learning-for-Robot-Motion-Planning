@@ -27,6 +27,10 @@ env/
 # === Datasets (large binary files) ===
 src/data/
 
+# === Claude Code ===
+CLAUDE.md
+.claude/
+
 # === Misc ===
 *.swp
 *.tmp

@@ -25,7 +25,7 @@
 <table>
   <tr>
     <td align="center"><b>Multi-obstacle environment</b></td>
-    <td align="center"><b>Tunnel avoidance</b></td>
+    <td align="center"><b>Tunneling failure (before fix)</b></td>
   </tr>
   <tr>
     <td><img src="src/resources/overfit_64_10_2obs_working_trajectory_16.gif" width="360"/></td>
@@ -122,7 +122,7 @@ The model is trained self-supervised on procedurally generated environments with
 |---|---|
 | `val_trajectories_working_trajectory_7.gif` | Predicted trajectory on a held-out validation sample |
 | `overfit_64_10_2obs_working_trajectory_16.gif` | Two-obstacle environment — arm routes around both obstacles |
-| `tunnel_trajectory.gif_trajectory_0.gif` | Narrow passage between obstacles — arm threads through |
+| `tunnel_trajectory.gif_trajectory_0.gif` | Early training failure — arm tunnels through an obstacle (problem subsequently fixed with CCD and exploration cost) |
 | `zero_output_trajectory_0.gif` | Baseline (network output = 0, i.e., straight-line interpolation) — collides |
 | `val_trajectories_working_cost_7.png` | Per-timestep collision and joint-limit costs after training |
 | `zero_output_cost_0.png` | Per-timestep costs for the straight-line baseline |

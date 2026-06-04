@@ -65,7 +65,7 @@ def browse_trajectories(
         ds["metadata"]["linklengths"],
         sphere_rad=ds["metadata"]["sphere_rad"],
     )
-
+    robot.sphere_rad = ds["metadata"]["sphere_rad"]
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -115,7 +115,7 @@ def browse_trajectories(
         )
 
         # Build robot figure
-        viz = RobotViewer(q_traj_np, robot, obstacles=obstacles_viz, animate=animate)
+        viz = RobotViewer(q_traj_np, robot, obstacles=obstacles_viz)
         _orig_show = go.Figure.show
         go.Figure.show = lambda *a, **kw: None
         try:

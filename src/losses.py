@@ -123,35 +123,44 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
          Set to 0 to disable.
     """
     B, T, dof = q_traj.shape
-
+    # Virtual intermediate trajectory: [B, T-1, dof]
+    q_midpoints = 0.5 * (q_traj[:, :-1, :] + q_traj[:, 1:, :])
+    
+    # Concatenate the real and the virtual trajectories
+    q_expanded = torch.zeros(B, 2 * T - 1, dof, device=q_traj.device, dtype=q_traj.dtype)
+    q_expanded[:, 0::2, :] = q_traj
+    q_expanded[:, 1::2, :] = q_midpoints
+    
+    T_exp = q_expanded.shape[1]
+    
     # --- Step 1: Forward kinematics -> world-space sphere positions ---
     # The robot arm is approximated by a set of spheres placed along its links.
     # get_world_spheres_torch runs FK for every (batch, timestep) configuration
     # and returns the 2D center position of each sphere in world coordinates.
-    q_flat = q_traj.reshape(B * T, dof)                     # flatten batch+time → [B*T, dof]
-    spheres = get_world_spheres_torch(q_flat, robot_info)     # [B*T, N_spheres, 2]
-    N_spheres = spheres.shape[1]
+    q_flat = q_expanded.reshape(B * T_exp, dof)                   # flatten batch+time → [B*T_exp, dof]
+    spheres_exp = get_world_spheres_torch(q_flat, robot_info)     # [B*T_exp, N_spheres, 2]
+    N_spheres = spheres_exp.shape[1]
 
     # Restore the time dimension so we can compute CCD travel distances later.
-    sphere_pos = spheres.reshape(B, T, N_spheres, 2)       # [B, T, N_spheres, 2]
+    sphere_pos_exp = spheres_exp.reshape(B, T_exp, N_spheres, 2)       # [B, T_exp, N_spheres, 2]
 
     # --- Step 2: SDF lookup — distance from each sphere center to the nearest obstacle ---
     # query_sdf_differentiable does bilinear interpolation on the SDF grid,
     # so gradients flow back through sphere positions into the joint angles.
     # Positive distance = sphere is outside all obstacles.
     # Negative distance = sphere center is inside an obstacle.
-    sphere_points = sphere_pos.reshape(B, T * N_spheres, 2)
-    distances = query_sdf_differentiable(sdf_batch, sphere_points, grid_length)
-    distances = distances.reshape(B, T, N_spheres)        # [B, T, N_spheres]
+    sphere_points_exp = sphere_pos_exp.reshape(B, T_exp * N_spheres, 2)
+    distances_exp = query_sdf_differentiable(sdf_batch, sphere_points_exp, grid_length)
+    distances_exp = distances_exp.reshape(B, T_exp, N_spheres)        # [B, T_exp, N_spheres]
 
     # --- Step 3: CCD — inflate the danger zone for fast-moving spheres ---
     # A sphere moving quickly can jump over a thin obstacle between two timesteps
     # (tunneling). To prevent this, we expand eps by half the sphere's travel
     # distance: a sphere that moves 0.1m in one step gets an extra 0.05m margin.
     if ccd:
-        travel = torch.norm(sphere_pos[:, 1:] - sphere_pos[:, :-1], dim=-1)  # [B, T-1, N_spheres]
-        travel = torch.cat([travel, travel[:, -1:]], dim=1)  # repeat last step → [B, T, N_spheres]
-        eff_eps = eps + travel / 2                            # effective danger zone per sphere
+        travel_exp = torch.norm(sphere_pos_exp[:, 1:] - sphere_pos_exp[:, :-1], dim=-1)  # [B, T_exp-1, N_spheres]
+        travel_exp = torch.cat([travel_exp, travel_exp[:, -1:]], dim=1)  # repeat last step → [B, T_exp, N_spheres]
+        eff_eps = eps + travel_exp / 2                            # effective danger zone per sphere
     else:
         eff_eps = eps
 
@@ -163,14 +172,54 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
     # This provides gradient everywhere in the workspace, so the arm is always
     # gently pushed away from obstacles — even before entering the danger zone.
     # Larger eps -> repulsion reaches farther -> arm routes around instead of squeezing through.
-    cost_inside = -distances + 0.5 * eff_eps
-    cost_danger = 0.5 * (distances - eff_eps) ** 2 / eff_eps
-    repulsion   = (eps * 0.5) * torch.exp(-distances.clamp(min=0) / eps)
-    per_sphere  = torch.where(distances < 0, cost_inside,
-                  torch.where(distances <= eff_eps, cost_danger,
-                  torch.zeros_like(distances))) + repulsion   # [B, T, N_spheres]
+    cost_inside = -distances_exp + 0.5 * eff_eps
+    cost_danger = 0.5 * (distances_exp - eff_eps) ** 2 / eff_eps
+    repulsion   = (eps * 0.5) * torch.exp(-distances_exp.clamp(min=0) / eps)
+    per_sphere_exp  = torch.where(distances_exp < 0, cost_inside,
+                  torch.where(distances_exp <= eff_eps, cost_danger,
+                  torch.zeros_like(distances_exp))) + repulsion   # [B, T_exp, N_spheres]
 
-    # --- Step 5: Joint-position weighting ---
+    # --- Step 5: Self-Collision ---
+    # Mutual distances matrix: [B*T_exp, N_spheres, N_spheres]
+    s1 = spheres_exp.unsqueeze(2)  # [B*T_exp, N_spheres, 1, 2]
+    s2 = spheres_exp.unsqueeze(1)  # [B*T_exp, 1, N_spheres, 2]
+    dist_matrix = torch.sqrt(torch.sum((s1 - s2) ** 2, dim=-1) + 1e-8)
+    
+    # Restore the time dimension
+    dist_matrix = dist_matrix.reshape(B, T_exp, N_spheres, N_spheres)
+
+    # Minimum distance allowed between not connected spheres
+    r = robot_info.sphere_rad
+    min_dist_allowed = 2 * r + eps * 0.5
+        
+    # Quadratic penalization for a penetration
+    self_penetration = torch.clamp(min_dist_allowed - dist_matrix, min=0.0) ** 2
+
+    # Exclude distances between themselves and with connected spheres
+    mask = torch.ones((N_spheres, N_spheres), device=q_traj.device)
+    for k in range(-1, 2):
+        mask = mask - torch.diag(torch.ones(N_spheres - abs(k), device=q_traj.device), diagonal=k)
+    mask = torch.clamp(mask, min=0.0, max=1.0)
+
+    # Apply the mask to the penetrations detected
+    masked_self_coll = self_penetration * mask.view(1, 1, N_spheres, N_spheres)
+
+    # Sum to know how much a sphere collisioned with others
+    per_sphere_self_cost_exp = masked_self_coll.sum(dim=-1) / max(1, N_spheres - 3)
+    per_sphere_exp = per_sphere_exp + (per_sphere_self_cost_exp * 3.0)
+
+    # Return to the original T
+    per_sphere = torch.zeros(B, T, N_spheres, device=q_traj.device, dtype=q_traj.dtype)
+    per_sphere[:, 0, :] = torch.max(per_sphere_exp[:, 0, :], per_sphere_exp[:, 1, :])
+
+    for t in range(1, T - 1):
+        per_sphere[:, t, :] = torch.max(
+            per_sphere_exp[:, 2 * t, :],
+            torch.max(per_sphere_exp[:, 2 * t - 1, :], per_sphere_exp[:, 2 * t + 1, :])
+        )
+    per_sphere[:, -1, :] = torch.max(per_sphere_exp[:, -1, :], per_sphere_exp[:, -2, :])
+    
+    # --- Step 6: Joint-position weighting ---
     # Base spheres cost more than tip spheres. This creates an incentive to shift
     # any collision from the forearm towards the EE: to do so, the arm must
     # bend — and that bending motion is geometrically equivalent to routing around

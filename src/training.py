@@ -73,6 +73,7 @@ def train(
     meta        = train_ds["metadata"]
     grid_length = meta["grid_length"]
     robot       = RobotInfo.from_linklengths(meta["linklengths"], sphere_rad=meta["sphere_rad"])
+    robot.sphere_rad = meta["sphere_rad"]
     q_min       = torch.tensor(meta["q_min"], dtype=torch.float32, device=device)
     q_max       = torch.tensor(meta["q_max"], dtype=torch.float32, device=device)
     q_min[0]    = -2 * torch.pi

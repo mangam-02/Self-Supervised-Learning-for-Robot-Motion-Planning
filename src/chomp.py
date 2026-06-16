@@ -28,8 +28,8 @@ import torch
 
 from simplearm.robot import RobotInfo
 
-from utils import get_world_spheres_torch, query_sdf_differentiable
 from models import build_bspline_interpolation_matrix
+from evaluation import evaluate_trajectory as _evaluate_trajectory, surface_clearance
 from losses import (
     compute_trajectory_collision_cost,
     compute_trajectory_max_collision_cost,
@@ -231,65 +231,26 @@ class CHOMPOptimizer:
 
     @torch.no_grad()
     def _surface_clearance(self, traj: torch.Tensor, sdf: torch.Tensor) -> torch.Tensor:
-        """
-        Signed distance of every robot-sphere SURFACE to the nearest obstacle,
-        shape [B, T*N]. Negative = penetration. Used both by evaluate_trajectory
-        and by the collision-free early-stop in optimize().
-        """
-        B, T, dof = traj.shape
-        spheres = get_world_spheres_torch(traj.reshape(B * T, dof), self.robot)  # [B*T, N, 2]
-        N       = spheres.shape[1]
-        dists   = query_sdf_differentiable(
-            sdf, spheres.reshape(B, T * N, 2), self.grid_length,
-        )  # [B, T*N] — each batch queried against its own SDF
-        return dists - float(getattr(self.robot, "sphere_rad", 0.0))
+        """Sphere-surface clearance [B, T*N] — used by the collision-free stop."""
+        return surface_clearance(traj, sdf, self.robot, self.grid_length)
 
     @torch.no_grad()
     def evaluate_trajectory(self, traj: torch.Tensor, sdf: torch.Tensor) -> dict:
         """
-        Comparison metric for any trajectory (model output or CHOMP output) — the
-        single source of truth for model-vs-CHOMP comparison. Uses the *evaluation*
-        weights (`eval_*`, default = Bigboy training objective), independent of the
-        optimizer's hyperparameters, so model and CHOMP are judged identically.
-        Reports only the physically meaningful terms (collision + joint-limits +
-        smoothness); the optional exploration / spacing search aids are excluded.
-        Both collision aggregations are reported.
-
-        Because the wide Bigboy repulsion field (eps=0.8) inflates the cost terms
-        with always-on repulsion, this also returns purely geometric feasibility
-        stats from the raw SDF (independent of any weight / eps) — the cleanest
-        comparison signal. The robot is a set of spheres of radius `sphere_rad`, so
-        feasibility uses the *surface* clearance (SDF(center) - sphere_rad), exactly
-        like the dataset's collision-free definition (data.is_collision_free):
-          - collision_free: True iff every sphere surface stays outside obstacles
-          - n_collision_pts: number of (timestep, sphere) samples in collision
-          - min_clearance: minimum surface clearance over the whole trajectory
-            (negative = deepest penetration; positive = tightest safe margin)
-
-        Returns python floats / bool.
+        Comparison metric for any trajectory (model output or CHOMP output) —
+        delegates to evaluation.evaluate_trajectory with this optimizer's *eval_*
+        weights (default = Bigboy training objective), so model and CHOMP are
+        judged identically, independent of the optimizer's own hyperparameters.
+        See evaluation.evaluate_trajectory for the full list of returned stats.
         """
         traj = self._as_batched_traj(traj)
         sdf  = self._as_batched_sdf(sdf, traj.shape[0])
-        coll_sum = self._collision_cost(traj, sdf, "sum", self.eval_eps, self.eval_w_coll).item()
-        coll_max = self._collision_cost(traj, sdf, "max", self.eval_eps, self.eval_w_coll).item()
-        coll     = coll_sum if self.eval_collision_agg == "sum" else coll_max
-        joints   = compute_trajectory_joint_limits_cost(traj, self.q_min, self.q_max, weight=self.eval_w_joints).item()
-        smooth   = compute_smoothness_cost(traj, dt=self.dt, weight=self.eval_w_smooth).item()
-
-        # Geometric feasibility — straight from the SDF, independent of weights/eps.
-        clearance = self._surface_clearance(traj, sdf)   # [B, T*N]
-
-        return {
-            "total":    coll + joints + smooth,
-            "coll":     coll,
-            "coll_sum": coll_sum,
-            "coll_max": coll_max,
-            "joints":   joints,
-            "smooth":   smooth,
-            "collision_free": bool((clearance >= 0).all().item()),
-            "n_collision_pts": int((clearance < 0).sum().item()),
-            "min_clearance":   float(clearance.min().item()),
-        }
+        return _evaluate_trajectory(
+            traj, sdf, self.robot, self.grid_length, self.q_min, self.q_max,
+            eps=self.eval_eps, w_coll=self.eval_w_coll, w_joints=self.eval_w_joints,
+            w_smooth=self.eval_w_smooth, collision_agg=self.eval_collision_agg,
+            dt=self.dt, ccd=self.ccd, joint_weight_decay=self.joint_weight_decay,
+        )
 
     # ── Initialisation helpers ───────────────────────────────────────────────
 

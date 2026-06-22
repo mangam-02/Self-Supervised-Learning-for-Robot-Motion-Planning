@@ -1,0 +1,3 @@
+[submodule "external/SimpleArm"]
+	path = external/SimpleArm
+	url = https://github.com/lstoex/SimpleArm.git

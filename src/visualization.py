@@ -11,6 +11,7 @@ from simplearm.viz import RobotViewer
 
 from models import WarmStartPlanner
 from losses import compute_trajectory_max_collision_cost, compute_trajectory_joint_limits_cost
+from evaluation import surface_clearance
 
 
 def _load(dataset: dict | str) -> dict:
@@ -77,26 +78,62 @@ def browse_trajectories(
     q_min   = torch.tensor(meta["q_min"], dtype=torch.float32, device=device)
     q_max   = torch.tensor(meta["q_max"], dtype=torch.float32, device=device)
 
-    idx      = [int(start_idx) % N]
-    state    = {"viz": None, "cost_fig": None}   # keep last render for saving
+
+    model.eval()
+    
+    with torch.no_grad():
+        # Generate all trajectories
+        all_waypoints = model(q_start, q_goal, sdf)
+        all_trajectories = model.trajectory(all_waypoints)
+
+        clearance_matrix = surface_clearance(
+            all_trajectories, sdf, robot, 
+            grid_length=meta["grid_length"], sphere_rad=meta["sphere_rad"]
+        )
+        
+        # Collision free?
+        min_clearance_per_sample = clearance_matrix.min(dim=-1)[0].cpu().numpy()
+
+    # Global counters
+    is_clean_mask = min_clearance_per_sample >= 0
+    total_clean = int(is_clean_mask.sum())
+    total_colliding = N - total_clean
+    collision_rate = (total_colliding / N) * 100
+
+    # Summary
+    summary_html = widgets.HTML(value=(
+        f"<div style='background-color: #f8f9fa; padding: 14px; border-radius: 8px; border-left: 5px solid #007bff; margin-bottom: 12px; font-family: sans-serif;'>"
+        f"  <h4 style='margin: 0 0 6px 0; color: #212529;'>📊 Global Test Summary (Geometric Feasibility)</h4>"
+        f"  <span style='color: #28a745; font-weight: bold;'>🟢 Clean Trajectories: {total_clean}</span> &nbsp;|&nbsp; "
+        f"  <span style='color: #dc3545; font-weight: bold;'>🔴 Colliding Trajectories: {total_colliding}</span> &nbsp;|&nbsp; "
+        f"  <b>⚠️ Collision Rate: {collision_rate:.2f}%</b>"
+        f"</div>"
+    ))
+    # -----------------------------------------------------------------
+
+    idx   = [int(start_idx) % N]
+    state = {"viz": None, "cost_fig": None}
 
     btn_prev   = widgets.Button(description="◄ Prev",   layout=widgets.Layout(width="100px"))
     btn_next   = widgets.Button(description="Next ►",   layout=widgets.Layout(width="100px"))
-    btn_save   = widgets.Button(description="💾 Save",  layout=widgets.Layout(width="100px"),
-                                button_style="info")
+    btn_save   = widgets.Button(description="💾 Save",  layout=widgets.Layout(width="100px"), button_style="info")
     save_dir   = widgets.Text(value="resources", description="Dir:", layout=widgets.Layout(width="200px"))
     info_label = widgets.HTML()
     out        = widgets.Output()
 
     def render():
         i = idx[0]
+        
+        # Individual state
+        is_sample_clean = is_clean_mask[i]
+        sample_min_clearance = min_clearance_per_sample[i]
+        
+        if is_sample_clean:
+            status_tag = f"<span style='background-color: #28a745; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold;'>✔️ GOOD (Clean, Clearance: {sample_min_clearance:.3f})</span>"
+        else:
+            status_tag = f"<span style='background-color: #dc3545; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold;'>❌ BAD (Collision, Penetration: {sample_min_clearance:.3f})</span>"
 
-        model.eval()
-        with torch.no_grad():
-            waypoints = model(q_start[i:i+1], q_goal[i:i+1], sdf[i:i+1])
-            traj      = model.trajectory(waypoints)
-
-        q_traj_np = traj.squeeze(0).cpu().numpy()
+        q_traj_np = all_trajectories[i].cpu().numpy()
         q_s_np    = q_start[i].cpu().numpy()
         q_g_np    = q_goal[i].cpu().numpy()
         n_obs     = ds["n_obstacles"][i].item()
@@ -109,12 +146,12 @@ def browse_trajectories(
         )
 
         info_label.value = (
-            f"<b>Sample {i} / {N - 1}</b> &nbsp;|&nbsp; obstacles: {n_obs}<br>"
+            f"<b>Sample {i} / {N - 1}</b> &nbsp;|&nbsp; obstacles: {n_obs} &nbsp;|&nbsp; {status_tag}<br>"
             f"&nbsp;&nbsp;q_start: {np.round(q_s_np, 3)}<br>"
             f"&nbsp;&nbsp;q_goal:&nbsp; {np.round(q_g_np, 3)}"
         )
 
-        # Build robot figure
+        # Interactive figure
         viz = RobotViewer(q_traj_np, robot, obstacles=obstacles_viz)
         _orig_show = go.Figure.show
         go.Figure.show = lambda *a, **kw: None
@@ -124,21 +161,21 @@ def browse_trajectories(
         finally:
             go.Figure.show = _orig_show
 
-        # Per-timestep cost plot
+        # Costs plot
         with torch.no_grad():
-            _, coll_per_step   = compute_trajectory_max_collision_cost(
-                traj, sdf[i:i+1], robot,
+            _, coll_per_step = compute_trajectory_max_collision_cost(
+                all_trajectories[i:i+1], sdf[i:i+1], robot,
                 grid_length=meta["grid_length"], eps=meta.get("collision_eps", 0.1),
                 return_per_step=True,
             )
             _, joints_per_step = compute_trajectory_joint_limits_cost(
-                traj, q_min, q_max, return_per_step=True,
+                all_trajectories[i:i+1], q_min, q_max, return_per_step=True,
             )
             coll_costs   = coll_per_step.squeeze(0).cpu().numpy()
             joints_costs = joints_per_step.squeeze(0).cpu().numpy()
 
-        T = len(coll_costs)
-        timesteps = np.arange(T)
+        T_steps = len(coll_costs)
+        timesteps = np.arange(T_steps)
         cost_fig = go.Figure()
         cost_fig.add_trace(go.Scatter(
             x=timesteps, y=coll_costs,
@@ -197,6 +234,7 @@ def browse_trajectories(
 
     render()
     display(widgets.VBox([
+        summary_html,
         widgets.HBox([btn_prev, btn_next, btn_save, save_dir]),
         info_label,
         out,

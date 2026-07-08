@@ -22,16 +22,14 @@ def compute_smoothness_cost(q, dt=0.1, weight=1.0):
     q: Tensor with the configurations
     dt: Time step
     """
-    # Vectors in the unit circle
-    q_sin = torch.sin(q)
-    q_cos = torch.cos(q)
+    # Difference in consecutive timesteps
+    diff = q[..., 1:, :] - q[..., :-1, :]
 
-    # Velocity difference
-    vel_sin = (q_sin[..., 1:, :] - q_sin[..., :-1, :]) / dt
-    vel_cos = (q_cos[..., 1:, :] - q_cos[..., :-1, :]) / dt
-    vel_sq = vel_sin**2 + vel_cos**2
+    # Using sine and cosine for shorter difference
+    short_diff = torch.atan2(torch.sin(diff), torch.cos(diff))
 
     # Penalize only the velocity
+    vel_sq = (short_diff / dt) ** 2
     return weight * torch.mean(vel_sq)
 
 def compute_collision_cost(distances, eps=0.1, weight=1.0):
@@ -88,11 +86,13 @@ def compute_exploration_cost(waypoints, q_start, q_goal, collision_cost,
     """
     # Obtain the baseline
     C = waypoints.shape[1]
-    t_vals = torch.linspace(0, 1, C, device=waypoints.device)
-    baseline = q_start.unsqueeze(1) + t_vals.view(1, -1, 1) * (q_goal - q_start).unsqueeze(1)
+    t_vals = torch.linspace(0, 1, C, device=waypoints.device).view(1, -1, 1)
+    total_diff = torch.atan2(torch.sin(q_goal - q_start), torch.cos(q_goal - q_start))
+    baseline = q_start.unsqueeze(1) + t_vals * total_diff.unsqueeze(1)
     
     # Compare the actual waypoints with the baseline
-    offsets = (waypoints - baseline)[:, 1:-1]          # [B, C-2, dof] — interior only
+    offsets = (waypoints - baseline)
+    offsets = torch.atan2(torch.sin(offsets), torch.cos(offsets))[:, 1:-1] # [B, C-2, dof]
     offset_mag = offsets.norm(dim=-1).mean(dim=-1)        # [B]
     
     # Return the cost
@@ -109,6 +109,7 @@ def compute_waypoint_spacing_cost(waypoints, weight=1.0):
     """
     # Calculate the distance between waypoints
     diffs     = waypoints[:, 1:] - waypoints[:, :-1]   # [B, C-1, dof]
+    diffs = torch.atan2(torch.sin(diffs), torch.cos(diffs))
     distances = torch.norm(diffs, dim=-1)               # [B, C-1]
     
     # Compute the mean distance and penalize according to the variance
@@ -132,7 +133,9 @@ def _compute_sphere_costs(q_traj, sdf_batch, robot_info,
     """
     B, T, dof = q_traj.shape
     # Virtual intermediate trajectory: [B, T-1, dof]
-    q_midpoints = 0.5 * (q_traj[:, :-1, :] + q_traj[:, 1:, :])
+    diff = q_traj[:, 1:, :] - q_traj[:, :-1, :]
+    short_diff = torch.atan2(torch.sin(diff), torch.cos(diff))
+    q_midpoints = q_traj[:, :-1, :] + 0.5 * short_diff
     
     # Concatenate the real and the virtual trajectories
     q_expanded = torch.zeros(B, 2 * T - 1, dof, device=q_traj.device, dtype=q_traj.dtype)

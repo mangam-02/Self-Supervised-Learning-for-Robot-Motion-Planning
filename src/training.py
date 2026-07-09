@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
@@ -38,8 +39,8 @@ def train(
     state_encoder_path: str | None = None,
     freeze_encoders: bool = False,
     # Training
-    n_epochs: int = 2000,
-    batch_size: int = 32,
+    n_epochs: int = 5000,
+    batch_size: int = 64,
     lr: float = 1e-3,
     # Loss weights
     w_coll: float = 1.0,
@@ -87,6 +88,7 @@ def train(
         val_sdf     = val_ds["sdf"].to(device)
         val_q_start = val_ds["q_start"].to(device)
         val_q_goal  = val_ds["q_goal"].to(device)
+        N_val       = val_sdf.shape[0]
 
     # Model
     model = WarmStartPlanner(dof=dof, T=T, C=C, linklengths=meta["linklengths"]).to(device)
@@ -116,7 +118,7 @@ def train(
     )
 
     # Decreasing learning rate
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9995)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-6)
 
     # Compute losses
     def compute_losses(waypoints, sdf_batch, q_s, q_g):
@@ -173,10 +175,20 @@ def train(
 
         if val_ds is not None and (epoch + 1) % log_every == 0:
             model.eval()
+            val_loss_total = 0.0
+
             with torch.no_grad():
-                val_wp  = model(val_q_start, val_q_goal, val_sdf)
-                val_loss, *_ = compute_losses(val_wp, val_sdf, val_q_start, val_q_goal)
-            history["val"].append(val_loss.item())
+                num_batches = (N_val + batch_size - 1) // batch_size
+                for b in range(num_batches):
+                    b_start = b * batch_size
+                    b_end = min((b + 1) * batch_size, N_val)
+                    
+                    val_wp_batch = model(val_q_start[b_start:b_end], val_q_goal[b_start:b_end], val_sdf[b_start:b_end])
+                    v_loss, *_ = compute_losses(val_wp_batch, val_sdf[b_start:b_end], val_q_start[b_start:b_end], val_q_goal[b_start:b_end])
+                    val_loss_total += v_loss.item() * (b_end - b_start)
+                    
+                val_loss_avg = val_loss_total / N_val
+            history["val"].append(val_loss_avg)
             model.train()
 
         if (epoch + 1) % log_every == 0:
@@ -225,9 +237,9 @@ def train_state_autoencoder(
     file_name: str,
     linklengths: list[float],
     dof: int = 3,
-    latent_dim: int = 64,
+    latent_dim: int = 12,
     N: int = 120_000,
-    batch_size: int = 64,
+    batch_size: int = 256,
     epochs: int = 5000,
     lr: float = 1e-3,
     log_every: int = 50,
@@ -256,6 +268,8 @@ def train_state_autoencoder(
     model = StateAutoEncoder(dof=dof, latent_dim=latent_dim, linklengths=linklengths).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
+    scheduler = CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
+
     def _eval(indices):
         model.eval()
         with torch.no_grad():
@@ -273,6 +287,7 @@ def train_state_autoencoder(
         opt.zero_grad()
         loss.backward()
         opt.step()
+        scheduler.step()
         history["train"].append(loss.item())
         if epoch % log_every == 0:
             history["val"].append(_eval(val_idx))
@@ -337,12 +352,21 @@ def train_env_autoencoder(
     model = EnvAutoEncoder(latent_dim=latent_dim).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
+    def weighted_sdf_loss(pred, target):
+        """
+        Stronger penalization in areas near to the obstacles.
+        """
+        weight = torch.where(target < 0.15, 5.0, 1.0)
+        return (weight * (pred - target) ** 2).mean()
+    
+    scheduler = CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
+
     def _eval(indices):
         model.eval()
         with torch.no_grad():
             sdf = sdf_dataset[indices].to(device)
             sdf_rec, _ = model(sdf)
-            return F.mse_loss(sdf_rec, sdf).item()
+            return weighted_sdf_loss(sdf_rec, sdf).item()
 
     history = {"train": [], "val": []}
 
@@ -352,10 +376,11 @@ def train_env_autoencoder(
         idx = train_idx[torch.randint(0, len(train_idx), (batch_size,))]
         sdf = sdf_dataset[idx].to(device)
         sdf_rec, _ = model(sdf)
-        loss = F.mse_loss(sdf_rec, sdf)
+        loss = weighted_sdf_loss(sdf_rec, sdf)
         opt.zero_grad()
         loss.backward()
         opt.step()
+        scheduler.step()
         history["train"].append(loss.item())
         if epoch % log_every == 0:
             history["val"].append(_eval(val_idx))

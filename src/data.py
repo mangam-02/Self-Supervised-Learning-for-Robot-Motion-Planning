@@ -54,6 +54,7 @@ def sample_circular_obstacles(
     workspace_radius: float = 1.0,
     dist_from_origin: tuple[float, float] | None = None,
     min_separation: float = 0.05,
+    min_base_clearance: float = 0.25,
     rng: np.random.Generator = None,
     max_tries: int = 300,
 ) -> Obstacles:
@@ -79,6 +80,9 @@ def sample_circular_obstacles(
             x, y  = r * np.cos(theta), r * np.sin(theta)
             rad   = rng.uniform(r_min, r_max)
 
+            if r - rad < min_base_clearance:
+                continue
+
             # Validate that the obstacles do not collide between them
             ok = all(
                 np.sqrt((x - px) ** 2 + (y - py) ** 2) >= rad + pr + min_separation
@@ -91,7 +95,7 @@ def sample_circular_obstacles(
 
     # Backup plan if there were not valid obstacles
     if not positions:
-        positions, radii = [(0.5, 0.0)], [0.1]
+        positions, radii = [(0.6, 0.0)], [0.1]
 
     # Return the valid positions
     xy = np.array(positions)
@@ -245,8 +249,10 @@ def straight_line_blocked(
     a trivial pair would teach the network to output straight-line interpolations.
     """
     ts = np.linspace(0, 1, n_check + 2)[1:-1]
+    diff = q_goal - q_start
+    short_diff = np.arctan2(np.sin(diff), np.cos(diff))
     for t in ts:
-        q_mid = (1 - t) * q_start + t * q_goal
+        q_mid = q_start + t * short_diff
         if not is_collision_free(q_mid, sdf_tensor, robot, grid_length):
             return True
     return False
@@ -309,6 +315,7 @@ def generate_dataset(
     workspace_radius: float = 1.0,
     dist_from_origin: tuple[float, float] | None = None,
     min_separation: float = 0.05,
+    min_base_clearance: float = 0.25,
     clearance: float = None,
     require_nontrivial: bool = True,
     n_check_midpoints: int = 9,
@@ -359,7 +366,7 @@ def generate_dataset(
         obstacles = sample_circular_obstacles(
             n_obstacles=n_obs, r_min=r_range[0], r_max=r_range[1],
             workspace_radius=workspace_radius, dist_from_origin=dist_from_origin,
-            min_separation=min_separation, rng=rng,
+            min_separation=min_separation, min_base_clearance=min_base_clearance, rng=rng,
         )
         sdf_tensor = build_sdf_tensor(obstacles, grid_length, n_vox)
 
@@ -481,6 +488,7 @@ def generate_sdf_dataset(
     N: int = 12000,
     save_path: str | None = None,
     seed: int = 42,
+    min_base_clearance: float = 0.25,
 ) -> torch.Tensor:
     """
     Generates N random SDF environments for environment autoencoder pre-training.
@@ -495,7 +503,13 @@ def generate_sdf_dataset(
     sdfs = []
     for _ in tqdm(range(N), desc="Generating SDF dataset"):
         n_obs = int(rng.integers(1, 5))
-        obs   = sample_circular_obstacles(n_obstacles=n_obs, rng=rng)
+        obs = sample_circular_obstacles(
+            n_obstacles=n_obs, 
+            r_min=0.06, 
+            r_max=0.18, 
+            min_base_clearance=min_base_clearance, 
+            rng=rng
+        )
         sdfs.append(build_sdf_tensor(obs))
     dataset = torch.stack(sdfs)
 

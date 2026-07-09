@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torchvision.models import resnet18, ResNet18_Weights
 from utils import forward_kinematics_torch
 
 # ----------------------------
@@ -93,48 +94,90 @@ def build_bspline_interpolation_matrix(T, C, degree=3, device="cpu"):
 
 class EnvEncoder(nn.Module):
     """
-    CNN that works as an intelligent image compressor
+    ResNet-18 adapted to process the SDF maps and compress them
+    into a latent vector
     """
     def __init__(self, latent=64):
         super().__init__()
-        # Reduce the SDF map (128x128) into a small
-        # latent vector (64)
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 4, 2, 1),   # 128 -> 64
-            nn.ReLU(),
-            nn.Conv2d(16, 32, 4, 2, 1),  # 64 -> 32
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1),  # 32 -> 16
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
+
+        # Load ResNet-18
+        base_resnet = resnet18(weights=None)
+
+        # Adapted architecture
+        base_resnet.conv1 = nn.Conv2d(
+            in_channels=1, 
+            out_channels=64, 
+            kernel_size=7, 
+            stride=2, 
+            padding=3, 
+            bias=False
         )
-        self.fc = nn.Linear(64, latent)
+
+        # Extract the convolutional blocks and average pooling
+        self.feature_extractor = nn.Sequential(
+            base_resnet.conv1,
+            base_resnet.bn1,
+            base_resnet.relu,
+            base_resnet.maxpool,
+            base_resnet.layer1,
+            base_resnet.layer2,
+            base_resnet.layer3,
+            base_resnet.layer4,
+            base_resnet.avgpool
+        )
+        
+        # Linear output layer
+        self.fc = nn.Linear(512, latent)
 
     def forward(self, x):
         # Data flow
-        return self.fc(self.net(x).squeeze(-1).squeeze(-1))
+        features = self.feature_extractor(x)
+        features = torch.flatten(features, 1)
+        return self.fc(features)
 
 
 class EnvDecoder(nn.Module):
     """
-    CNN that works as an intelligent image generator
+    CNN that takes the latent vector and rebuilds the SDF map
     """
     def __init__(self, latent=64):
         super().__init__()
-        # From the latent vector (64), rebuild the
+        # From the latent vector, rebuild the
         # SDF map (128x128)
-        self.fc = nn.Linear(latent, 64 * 16 * 16)
+        self.fc = nn.Linear(latent, 256 * 4 * 4)
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 16 -> 32
+            # 4x4 -> 8x8
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 16, 4, 2, 1),  # 32 -> 64
+
+            # Extra refining
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.ConvTranspose2d(16, 1, 4, 2, 1),   # 64 -> 128
+
+            # 8x8 -> 16x16
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            
+            # 16x16 -> 32x32
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            
+            # 32x32 -> 64x64
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            
+            # 64x64 -> 128x128
+            nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1),
         )
 
     def forward(self, z):
         # Data flow
-        return self.net(self.fc(z).view(-1, 64, 16, 16))
+        return self.net(self.fc(z).view(-1, 256, 4, 4))
 
 
 class StateEncoder(nn.Module):
@@ -156,7 +199,7 @@ class StateEncoder(nn.Module):
 class StateDecoder(nn.Module):
     """
     FCN that unpackages the robot's movement task information from
-    the latent vector.
+    the latent vector
     """
     def __init__(self, output_dim, latent_dim=64, hidden=128):
         super().__init__()
@@ -174,12 +217,14 @@ class WaypointDecoder(nn.Module):
     """
     Predicts C-2 interior waypoints (start and goal are fixed externally).
     """
-    def __init__(self, latent_env=64, latent_state=64, C=10, dof=3):
+    def __init__(self, latent_env=64, latent_state=12, C=10, dof=3):
         super().__init__()
         self.C = C
         self.dof = dof
         self.mlp = nn.Sequential(
             nn.Linear(latent_env + latent_state, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
             nn.ReLU(),
             nn.Linear(256, (C - 2) * dof),
         )
@@ -214,9 +259,9 @@ class WarmStartPlanner(nn.Module):
         fk_dim         = (dof + 1) * 2
         state_input_dim = 2 * dof + 2 * fk_dim   # q_start + q_goal + fk_start + fk_goal
 
-        self.env_encoder   = EnvEncoder()
-        self.state_encoder = StateEncoder(input_dim=state_input_dim, latent_dim=64)
-        self.decoder       = WaypointDecoder(dof=dof, C=C)
+        self.env_encoder   = EnvEncoder(latent=64)
+        self.state_encoder = StateEncoder(input_dim=state_input_dim, latent_dim=12)
+        self.decoder       = WaypointDecoder(latent_env=64, latent_state=12, dof=dof, C=C)
 
         self.register_buffer("M", build_bspline_interpolation_matrix(T, C, degree=3))
 
@@ -228,6 +273,8 @@ class WarmStartPlanner(nn.Module):
     def forward(self, q_start, q_goal, sdf):
         """Returns C waypoints [B, C, dof] — use .trajectory() to get the full B-spline."""
         state = self._state_features(q_start, q_goal)
+        if sdf.ndim == 3:
+            sdf = sdf.unsqueeze(1)
         offset = self.decoder(self.env_encoder(sdf), self.state_encoder(state))
 
         # Linear interpolation as baseline — offset=0 means straight-line trajectory

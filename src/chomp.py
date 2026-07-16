@@ -1,10 +1,12 @@
 """
 chomp.py — CHOMP trajectory optimizer.
 
-A classical, learning-free trajectory optimizer that minimizes the *same*
-differentiable cost terms the WarmStartPlanner is trained on, so the two can be
-compared head-to-head on identical numbers. It can also refine an existing
-trajectory (e.g. the model's output): run the model first, then keep optimizing.
+A classical, learning-free trajectory optimizer built from the same differentiable
+cost terms (losses.py) the WarmStartPlanner is trained on, so it can be pointed at
+that model's exact loss weights and compared head-to-head. It can also refine an
+existing trajectory (e.g. the model's output): run the model first, then keep
+optimizing. Note the weights are constructor arguments, not defaults — see the
+CHOMPOptimizer docstring.
 
 CHOMP (Covariant Hamiltonian Optimization for Motion Planning) minimizes
     U(xi) = collision(xi) + joint_limits(xi) + smoothness(xi)
@@ -29,7 +31,7 @@ import torch
 from simplearm.robot import RobotInfo
 
 from models import build_bspline_interpolation_matrix
-from evaluation import evaluate_trajectory as _evaluate_trajectory, surface_clearance
+from evaluation import surface_clearance
 from losses import (
     compute_trajectory_collision_cost,
     compute_trajectory_max_collision_cost,
@@ -65,19 +67,17 @@ class CHOMPOptimizer:
     """
     CHOMP trajectory optimizer over a dense [B, T, dof] trajectory.
 
-    Two independent weight sets are kept on purpose:
+    The weights below (`eps`, `w_coll`, `w_smooth`, ...) drive the covariant
+    gradient descent. Their defaults are tuned for single-trajectory CHOMP (tight
+    collision band, light smoothness) and are NOT copied from any training run.
 
-    * Optimization hyperparameters (`eps`, `w_coll`, `w_smooth`, ...) drive the
-      covariant gradient descent. Their defaults are tuned for single-trajectory
-      CHOMP (tight collision band, light smoothness), NOT copied from training.
-      The Bigboy training weights (wide eps=0.8 + strong smoothness) are great for
-      training a network but make single-trajectory CHOMP straighten wide detours
-      back into obstacles, so they are deliberately not the optimizer defaults.
+    To compare CHOMP against a trained model fairly, pass that model's own loss
+    weights instead of relying on these defaults — otherwise the two are pursuing
+    different objectives and the comparison says little. See chomp_test.ipynb.
+    Note that `eta` couples to the weight scale: the step is (1/eta) * A^-1 * grad,
+    so unlike Adam this descent is not invariant to scaling the cost.
 
-    * Evaluation weights (`eval_*`) define the *comparison metric* and default to
-      the Bigboy training objective, so the model and CHOMP are judged on exactly
-      the loss the WarmStartPlanner was trained on. `evaluate_trajectory` always
-      uses these (plus weight-independent geometric feasibility stats).
+    Scoring a trajectory is a separate concern — use evaluation.TrajectoryEvaluator.
     """
 
     def __init__(
@@ -102,12 +102,6 @@ class CHOMPOptimizer:
         w_spacing: float = 0.0,
         explore_threshold: float = 0.5,
         eta: float = 1500.0,
-        # --- Evaluation / comparison metric (defaults: Bigboy training objective) ---
-        eval_eps: float = 0.8,
-        eval_w_coll: float = 50.0,
-        eval_w_joints: float = 0.1,
-        eval_w_smooth: float = 1.0,
-        eval_collision_agg: str = "max",
         device: str | None = None,
     ):
         if device is None:
@@ -142,15 +136,6 @@ class CHOMPOptimizer:
         self.w_spacing   = w_spacing
         self.explore_threshold = explore_threshold
         self.eta         = eta
-
-        # Comparison-metric weights (independent of the optimizer's HP).
-        if eval_collision_agg not in ("sum", "max"):
-            raise ValueError("eval_collision_agg must be 'sum' or 'max'")
-        self.eval_eps           = eval_eps
-        self.eval_w_coll        = eval_w_coll
-        self.eval_w_joints      = eval_w_joints
-        self.eval_w_smooth      = eval_w_smooth
-        self.eval_collision_agg = eval_collision_agg
 
         # Covariant-update metric — precomputed once, shared across the batch.
         self.A_inv = _build_smoothness_metric(T, device=device)
@@ -233,24 +218,6 @@ class CHOMPOptimizer:
     def _surface_clearance(self, traj: torch.Tensor, sdf: torch.Tensor) -> torch.Tensor:
         """Sphere-surface clearance [B, T*N] — used by the collision-free stop."""
         return surface_clearance(traj, sdf, self.robot, self.grid_length)
-
-    @torch.no_grad()
-    def evaluate_trajectory(self, traj: torch.Tensor, sdf: torch.Tensor) -> dict:
-        """
-        Comparison metric for any trajectory (model output or CHOMP output) —
-        delegates to evaluation.evaluate_trajectory with this optimizer's *eval_*
-        weights (default = Bigboy training objective), so model and CHOMP are
-        judged identically, independent of the optimizer's own hyperparameters.
-        See evaluation.evaluate_trajectory for the full list of returned stats.
-        """
-        traj = self._as_batched_traj(traj)
-        sdf  = self._as_batched_sdf(sdf, traj.shape[0])
-        return _evaluate_trajectory(
-            traj, sdf, self.robot, self.grid_length, self.q_min, self.q_max,
-            eps=self.eval_eps, w_coll=self.eval_w_coll, w_joints=self.eval_w_joints,
-            w_smooth=self.eval_w_smooth, collision_agg=self.eval_collision_agg,
-            dt=self.dt, ccd=self.ccd, joint_weight_decay=self.joint_weight_decay,
-        )
 
     # ── Initialisation helpers ───────────────────────────────────────────────
 

@@ -140,6 +140,9 @@ class CHOMPOptimizer:
         # Covariant-update metric — precomputed once, shared across the batch.
         self.A_inv = _build_smoothness_metric(T, device=device)
 
+        # B-spline matrices for warm starts, built lazily per control-point count.
+        self._bspline_cache: dict[int, torch.Tensor] = {}
+
     @classmethod
     def from_metadata(cls, meta: dict, **overrides) -> "CHOMPOptimizer":
         """
@@ -221,6 +224,19 @@ class CHOMPOptimizer:
 
     # ── Initialisation helpers ───────────────────────────────────────────────
 
+    def _bspline_matrix(self, C: int) -> torch.Tensor:
+        """
+        [T, C] B-spline matrix mapping control points to the dense trajectory — the same
+        one WarmStartPlanner uses. It depends only on (T, C, degree, device), but costs
+        ~75 ms to build, so cache it per C: rebuilding it on every warm-started optimize()
+        dwarfed the optimization itself.
+        """
+        M = self._bspline_cache.get(C)
+        if M is None:
+            M = build_bspline_interpolation_matrix(self.T, C, degree=3, device=self.device)
+            self._bspline_cache[C] = M
+        return M
+
     def _as_batched_traj(self, traj: torch.Tensor) -> torch.Tensor:
         traj = traj.to(self.device).float()
         if traj.ndim == 2:           # [T, dof] -> [1, T, dof]
@@ -265,9 +281,7 @@ class CHOMPOptimizer:
             wp = init_waypoints.to(self.device).float()
             if wp.ndim == 2:
                 wp = wp.unsqueeze(0)
-            C = wp.shape[1]
-            M = build_bspline_interpolation_matrix(self.T, C, degree=3, device=self.device)
-            traj = torch.einsum("tc,bcd->btd", M, wp)
+            traj = torch.einsum("tc,bcd->btd", self._bspline_matrix(wp.shape[1]), wp)
         else:
             t = torch.linspace(0, 1, self.T, device=self.device).view(1, -1, 1)
             traj = q_start.unsqueeze(1) + t * (q_goal - q_start).unsqueeze(1)

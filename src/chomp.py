@@ -288,6 +288,7 @@ class CHOMPOptimizer:
         init_waypoints: torch.Tensor | None = None,
         max_iters: int = 500,
         eta: float | None = None,
+        max_backtracks: int = 12,
         tol: float = 1e-3,
         patience: int = 15,
         stop_at_collision_free: bool = True,
@@ -300,6 +301,15 @@ class CHOMPOptimizer:
         """
         Run CHOMP covariant gradient descent until convergence (not a fixed number
         of steps), so wall-clock time is a meaningful quantity to compare.
+
+        Each iteration takes the covariant step 1/eta * A^-1 grad(U), backtracked
+        (halved up to `max_backtracks` times) until the total cost actually decreases,
+        so the descent is monotone. Without it a fixed step overshoots on a stiff cost
+        and can end worse than it started — in particular it would corrupt a warm-started
+        trajectory that is already near a minimum. `eta` therefore sets the *largest*
+        step considered, not the step taken. The search uses the batch-summed cost, so
+        for B > 1 all samples share one step scale; optimize per sample (B = 1) when the
+        step size matters.
 
         Stopping criteria (whichever fires first):
           * collision-free: every `check_every` iters, if all sphere surfaces are
@@ -334,6 +344,14 @@ class CHOMPOptimizer:
         B    = traj.shape[0]
         sdf  = self._as_batched_sdf(sdf, B)
 
+        def _take_step(traj, step, scale):
+            """Apply a scaled covariant step; endpoints stay pinned to q_start/q_goal."""
+            out = traj.detach().clone()
+            out[:, 1:-1, :] = out[:, 1:-1, :] - scale * step
+            out[:, 0, :]    = q_start
+            out[:, -1, :]   = q_goal
+            return out
+
         history = []
         prev_cost, stalls = None, 0
         for it in range(max_iters):
@@ -346,13 +364,24 @@ class CHOMPOptimizer:
             grad_inner = grad[:, 1:-1, :]                        # [B, T-2, dof]
             step       = torch.einsum("ij,bjd->bid", self.A_inv, grad_inner)
 
-            with torch.no_grad():
-                traj = traj.detach()
-                traj[:, 1:-1, :] = traj[:, 1:-1, :] - (1.0 / eta) * step
-                traj[:, 0, :]    = q_start
-                traj[:, -1, :]   = q_goal
-
             cur = total.item()
+
+            # Backtracking line search: a fixed 1/eta step overshoots badly on this cost
+            # (a strong collision weight over a narrow eps band is stiff), which makes the
+            # descent oscillate and can leave a warm-started trajectory worse than it began.
+            # Halve the step until the cost actually decreases; give up after max_backtracks
+            # and take no step, which then trips the plateau test below.
+            with torch.no_grad():
+                scale = 1.0 / eta
+                for _ in range(max_backtracks):
+                    cand = _take_step(traj, step, scale)
+                    cand_cost = self._compute_cost(cand, sdf)[0].item()
+                    if cand_cost <= cur:
+                        break
+                    scale *= 0.5
+                else:
+                    cand, cand_cost = traj.detach().clone(), cur
+                traj = cand
 
             # --- Stopping checks (on the freshly updated trajectory) ---
             free = False

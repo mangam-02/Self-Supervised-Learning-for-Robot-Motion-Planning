@@ -35,46 +35,43 @@ def build_sdf_tensor(
 
 def generate_blob_mask(x_grid, y_grid, cx, cy, r_base, rng):
     """
-    Genera formas orgánicas agresivas garantizando que NINGÚN punto del obstáculo
-    exceda la distancia 'r_base' desde el centro (cx, cy).
+    Generates shapes verifying that not a single point exceeds the r_base distance
+    from the center (cx, cy).
     """
-    # 1. Distancia y ángulo de cada píxel respecto al centro
+    # Distance and angle of each pixel w.r.t the center
     dx = x_grid - cx
     dy = y_grid - cy
     dist = np.sqrt(dx**2 + dy**2)
     angle = np.arctan2(dy, dx)
-    
-    # 2. Perfil base (1.0 = círculo perfecto)
+
+    # Base profile (a perfect circle)
     profile = np.ones_like(angle)
-    
-    # 3. Aplastamiento direccional (Crea objetos largos)
-    # Solo aplastamos hacia adentro (valores menores a 1), nunca expandimos
+
+    # Inward directional crushing
     squish_angle = rng.uniform(0, 2 * np.pi)
     squish_factor = rng.uniform(0.2, 0.8) 
-    
-    # Modulamos el perfil con una onda basada en la dirección del aplastamiento
+
+    # Modulate the profile with a wave based on its crushing direction
     profile *= (squish_factor + (1 - squish_factor) * np.abs(np.cos(angle - squish_angle)))
-    
-    # 4. Ruido de armónicos agresivo para asimetría y formas irregulares
+
+    # Agressive armonic noise for asymmetry and irregular shapes
     n_harmonics = rng.integers(2, 5)
     for _ in range(n_harmonics):
-        freq = rng.integers(2, 5) # Frecuencias bajas para deformar la topología
+        freq = rng.integers(2, 5) # Low freq to deform the topology
         amp = rng.uniform(0, 0.5) / n_harmonics 
         phase = rng.uniform(0, 2 * np.pi)
         profile += amp * np.sin(freq * angle + phase)
-        
-    # 5. Evitar valores negativos o cero si el ruido fue muy fuerte
+
+    # Avoid negative values or zero
     profile = np.clip(profile, 0.05, None)
-    
-    # 6. EL PASO CLAVE: Normalización estricta
-    # Dividimos todo el perfil por su valor máximo. 
-    # Ahora, el punto más lejano del centro vale exactamente 1.0.
+
+    # Normalization
     profile = profile / np.max(profile)
-    
-    # 7. Escalar al radio real permitido
+
+    # Scale with the r_base
     r_actual = r_base * profile
-    
-    # La máscara evalúa qué píxeles están dentro de nuestro nuevo radio seguro
+
+    # Evaluate mask
     return dist <= r_actual
 
 def sample_circular_obstacles(
@@ -85,7 +82,7 @@ def sample_circular_obstacles(
     dist_from_origin: tuple[float, float] | None = None,
     min_separation: float = 0.05,
     min_base_clearance: float = 0.35,
-    robot_sphere_rad: float = 0.08,  # <-- NUEVO: Para conocer el volumen base del robot
+    robot_sphere_rad: float = 0.08,
     rng: np.random.Generator = None,
     max_tries: int = 300,
 ) -> Obstacles:
@@ -97,33 +94,31 @@ def sample_circular_obstacles(
     """
     if rng is None:
         rng = np.random.default_rng()
-        
-    # d_min y d_max ahora dictan la distancia desde el origen a la FRONTERA del obstáculo
+
+    # d_min and d_max are the distances from the origin to the border of the obstacle
     d_min, d_max = dist_from_origin if dist_from_origin is not None else (0.15, workspace_radius * 0.85)
 
     positions, radii = [], []
     for _ in range(n_obstacles):
         for _ in range(max_tries):
-            # 1. Obtenemos el radio ANTES de ubicar el centro
+            # Get the radius
             rad = rng.uniform(r_min, r_max)
-            
-            # 2. Calculamos los límites para el centro basándonos en la frontera
-            # Queremos que la distancia del origen al borde del obstáculo sea al menos d_min.
-            # Además, el borde no debe invadir las esferas físicas del robot (min_base_clearance + robot_sphere_rad).
+
+            # Calculate the limits for the center based on the borders
             r_min_center = max(d_min + rad, min_base_clearance + robot_sphere_rad + rad)
-            
-            # El centro no debe estar tan lejos que el obstáculo se salga del workspace
+
+            # The center should not be out of the workspace
             r_max_center = min(d_max + rad, workspace_radius - rad)
             
             if r_min_center >= r_max_center:
-                continue  # Intentar con un nuevo radio si la geometría es imposible
-                
-            # 3. Muestreamos el centro usando los límites correctos
+                continue  # Try a new radius if the geommetry is unfeasible
+
+            # Sample the center using the correct limits
             r = rng.uniform(r_min_center, r_max_center)
             theta = rng.uniform(0, 2 * np.pi)
             x, y = r * np.cos(theta), r * np.sin(theta)
 
-            # Validar que los obstáculos no colisionen entre sí
+            # Validate that the obstacles do not collide between them
             ok = all(
                 np.sqrt((x - px) ** 2 + (y - py) ** 2) >= rad + pr + min_separation
                 for (px, py), pr in zip(positions, radii)
@@ -216,7 +211,7 @@ def browse_dataset(
         q_goal_np  = dataset["q_goal"][i].numpy()
         sdf_sample = dataset["sdf"][i]
         
-        # Revisar si el dataset es de vóxeles o de obstáculos circulares
+        # Check if the dataset has voxels or circles
         if "n_obstacles" in dataset:
             n_obs = dataset["n_obstacles"][i].item()
             obs_info = f"obstacles: {n_obs}"
@@ -381,18 +376,17 @@ def generate_dataset(
     rng = np.random.default_rng(seed)
 
     all_sdfs, all_voxels, all_q_starts, all_q_goals = [], [], [], []
-    all_obs_x, all_obs_y, all_obs_r, all_n_obs = [], [], [], [] # <-- Recuperado para el dataset
+    all_obs_x, all_obs_y, all_obs_r, all_n_obs = [], [], [], []
     n_attempted, n_no_pair = 0, 0
 
-    # Pre-calcular las coordenadas X e Y de la grilla para generar los blobs rápido
+    # Pre-compute the X and Y coordinates of the grid
     lin = np.linspace(-grid_length / 2, grid_length / 2, n_vox)
     x_grid, y_grid = np.meshgrid(lin, lin)
     
-    # RENOMBRADO a grid_dist para no sobreescribir el parámetro dist_from_origin
     grid_dist = np.sqrt(x_grid**2 + y_grid**2)
 
     for _ in tqdm(range(N_envs), desc="Generating dataset (Organic Blobs)"):
-        # 1. Decidir cuántos obstáculos y obtener sus centros
+        # Decide how many obstacles and get their centers
         n_obs = int(rng.integers(n_obstacles_range[0], n_obstacles_range[1] + 1))
         
         obs = sample_circular_obstacles(
@@ -400,14 +394,14 @@ def generate_dataset(
             r_min=r_range[0],
             r_max=r_range[1],
             workspace_radius=workspace_radius,
-            dist_from_origin=dist_from_origin,       # <-- Pasado a la función
-            min_separation=min_separation,           # <-- Pasado a la función
-            min_base_clearance=min_base_clearance,   # <-- Pasado a la función
+            dist_from_origin=dist_from_origin,       
+            min_separation=min_separation,           
+            min_base_clearance=min_base_clearance,   
             robot_sphere_rad=sphere_rad,
             rng=rng
         )
 
-        # 2. Construir la matriz de vóxeles y dibujar las formas orgánicas
+        # Build the voxels matrix and draw the shapes
         voxel_data = np.zeros((n_vox, n_vox), dtype=bool)
         
         for i in range(len(obs.x)):
@@ -418,7 +412,7 @@ def generate_dataset(
             )
             voxel_data = np.logical_or(voxel_data, blob_mask)
         
-        # 3. Aplicar máscara de workspace usando grid_dist
+        # Apply the workspace mask using grid_dist
         voxel_data[grid_dist > workspace_radius] = False
 
         grid_vox = SquareGrid.from_zero_centered(
@@ -426,7 +420,7 @@ def generate_dataset(
             data=voxel_data
         )
 
-        # 4. Derivar tensores
+        # Derivate tensors
         sdf_tensor = build_sdf_tensor(grid_vox)
         vox_tensor = torch.from_numpy(grid_vox.data.astype(np.float32)).unsqueeze(0)
 
@@ -461,7 +455,7 @@ def generate_dataset(
             all_q_starts.append(torch.from_numpy(q_start).float())
             all_q_goals.append(torch.from_numpy(q_goal).float())
             
-            # Guardamos la info original de los obstáculos por si necesitas visualizarla
+            # Save original info
             all_obs_x.append(obs.x.copy())
             all_obs_y.append(obs.y.copy())
             all_obs_r.append(obs.r.copy())
@@ -477,7 +471,7 @@ def generate_dataset(
         print("WARNING: No data points generated. Check parameters.")
         return {}
 
-    # <-- Padding de los obstáculos recuperado del código antiguo
+    # Padding
     max_n_obs  = max(all_n_obs) if all_n_obs else 0
     obs_padded = torch.zeros(N_total, max_n_obs, 3)
     for i, (x, y, r) in enumerate(zip(all_obs_x, all_obs_y, all_obs_r)):
@@ -503,8 +497,8 @@ def generate_dataset(
         "voxels":      torch.stack(all_voxels), 
         "q_start":     torch.stack(all_q_starts),
         "q_goal":      torch.stack(all_q_goals),
-        "obstacles":   obs_padded,                          # <-- Añadido al dicc
-        "n_obstacles": torch.tensor(all_n_obs, dtype=torch.long), # <-- Añadido al dicc
+        "obstacles":   obs_padded,                          
+        "n_obstacles": torch.tensor(all_n_obs, dtype=torch.long),
         "metadata":    metadata,
     }
 
@@ -532,8 +526,8 @@ def generate_dataset(
                 "voxels":      dataset["voxels"][indices],
                 "q_start":     dataset["q_start"][indices],
                 "q_goal":      dataset["q_goal"][indices],
-                "obstacles":   dataset["obstacles"][indices],       # <-- Añadido al split
-                "n_obstacles": dataset["n_obstacles"][indices],     # <-- Añadido al split
+                "obstacles":   dataset["obstacles"][indices],       
+                "n_obstacles": dataset["n_obstacles"][indices],    
                 "metadata":    {**metadata, "N": len(indices)},
             }
             path = f"{base}_{name}{ext}"
@@ -564,8 +558,8 @@ def generate_sdf_dataset(
 
     rng  = np.random.default_rng(seed)
     sdfs = []
-    
-    # 1. Pre-calcular las coordenadas X e Y de la grilla 
+
+    # Pre-compute the X and Y coordinates in the grid
     lin = np.linspace(-grid_length / 2, grid_length / 2, n_vox)
     x_grid, y_grid = np.meshgrid(lin, lin)
     dist_from_origin = np.sqrt(x_grid**2 + y_grid**2)
@@ -579,8 +573,8 @@ def generate_sdf_dataset(
             min_base_clearance=min_base_clearance, 
             rng=rng
         )
-        
-        # 2. Construir la matriz de vóxeles y dibujar las formas orgánicas
+
+        # Build the voxels matrix and draw the shapes
         voxel_data = np.zeros((n_vox, n_vox), dtype=bool)
         for i in range(len(obs.x)):
             blob_mask = generate_blob_mask(
@@ -589,17 +583,17 @@ def generate_sdf_dataset(
                 rng=rng
             )
             voxel_data = np.logical_or(voxel_data, blob_mask)
-            
-        # 3. Aplicar máscara de workspace para liberar espacio
+
+        # Apply the workspace mask
         voxel_data[dist_from_origin > workspace_radius] = False
-        
-        # 4. Crear el objeto SquareGrid que necesita build_sdf_tensor
+
+        # Create the SquareGrid object
         grid_vox = SquareGrid.from_zero_centered(
             limits=(-grid_length / 2, grid_length / 2), 
             data=voxel_data
         )
 
-        # 5. Generar y guardar el tensor
+        # Generate and save the tensor
         sdfs.append(build_sdf_tensor(grid_vox))
         
     dataset = torch.stack(sdfs)
@@ -626,8 +620,8 @@ def print_dataset_stats(dataset: dict | str, n_collision_check: int = 100):
     robot       = RobotInfo.from_linklengths(meta["linklengths"], sphere_rad=meta["sphere_rad"])
 
     print(f"Dataset: {N} samples")
-    
-    # Adaptación para aceptar tanto formato antiguo (obstacles) como nuevo (voxels)
+
+    # Accept either circles or voxels
     keys_to_print = ["sdf", "q_start", "q_goal"]
     if "voxels" in dataset:
         keys_to_print.append("voxels")

@@ -136,11 +136,11 @@ def browse_trajectories(
         q_traj_np = all_trajectories[i].cpu().numpy()
         q_s_np    = q_start[i].cpu().numpy()
         q_g_np    = q_goal[i].cpu().numpy()
-        
-        # Obtenemos la matriz de vóxeles del sample actual
+
+        # Get the voxels matrix
         vox_data = ds["voxels"][i, 0].numpy().astype(bool)
-        
-        # Reconstruimos la estructura SquareGrid para que el visor la dibuje directamente
+
+        # Rebuild the SquareGrid structure
         voxels_grid = SquareGrid.from_zero_centered(
             limits=(-meta["grid_length"] / 2, meta["grid_length"] / 2),
             data=vox_data.T
@@ -152,7 +152,7 @@ def browse_trajectories(
             f"&nbsp;&nbsp;q_goal:&nbsp; {np.round(q_g_np, 3)}"
         )
 
-        # Instanciamos enviando la propiedad voxels en vez de obstacles
+        # Instantiate using the voxels
         viz = RobotViewer(q_traj_np, robot, obstacles=None, voxels=voxels_grid)
         
         _orig_show = go.Figure.show

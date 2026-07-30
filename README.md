@@ -233,8 +233,10 @@ Implementation notes that mattered in practice:
 
 Two models were benchmarked, each on **1000 held-out test problems** from its own distribution:
 
-- **Run A, circular obstacles** (`wsp_general_0907_v1`): 1-3 small circles, links `[0.3, 0.4, 0.3]`.
-- **Run B, organic blob obstacles** (`wsp_general_shapes_1707_v1`): 2-4 large irregular blobs, links `[0.35, 0.45, 0.2]`. Substantially harder: more of the workspace is occupied and passages are narrower.
+Both runs use the **same robot**: links `[0.35, 0.45, 0.2]`, `sphere_rad=0.08`, `q_min/q_max = ±0.9π`, a 2.5 m workspace on a 128×128 grid (verified against the `metadata` dict stored in each `data/dataset_*.pt`). Only the obstacle distribution differs:
+
+- **Run A, circular obstacles** (`wsp_general_0907_v1`, dataset `dataset_general_0807_*`): 1-3 circles, radii 0.06-0.18 m, at least 0.61 m from the base. 9998 samples (6998 / 1499 / 1501).
+- **Run B, organic blob obstacles** (`wsp_general_shapes_1707_v1`, dataset `dataset_general_shapes_1707_*`): 2-4 large irregular blobs, sizes 0.15-0.28 m, `min_base_clearance=0.35` m. 10000 samples (7000 / 1500 / 1500). Substantially harder: more of the workspace is occupied and passages are narrower.
 
 Five methods per run. Every CHOMP variant is given the corresponding model's own training loss
 weights, and all methods are scored by the same weight-independent feasibility criterion (see
@@ -374,7 +376,7 @@ no tail. Warm-started CHOMP retains a heavy tail on the hard minority, which is 
 
 - **Timings are CPU, single sample at a time** (`device="cpu"`, B=1), so they measure per-problem latency, not throughput. Batched GPU inference would widen the network's advantage further.
 - **Warm CHOMP occasionally regresses a good trajectory** (5 and 3 trials). The line search guarantees monotone *cost* descent, but cost and geometric feasibility are not the same objective: a cheaper trajectory can be marginally in collision.
-- **Run A and Run B use different robots and obstacle distributions** and are not directly comparable to each other; only the methods within a run are.
+- **Run A and Run B use different obstacle distributions** (the robot is identical) and are not directly comparable to each other; only the methods within a run are.
 - **The remaining infeasible trials are not analyzed.** Whether the 6.6 % in Run B are genuine narrow-passage problems or dataset artifacts (start/goal pairs sampled too close to obstacles) is open.
 
 Full figure sets (crash-free rate, computation time, iterations, joint violations, smoothness,
